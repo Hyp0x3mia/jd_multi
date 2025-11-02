@@ -185,51 +185,79 @@ async def _auto_login_jd(page):
 
 
 async def _detect_2fa_required(page):
-    """检测页面是否需要二次认证（如扫码验证）"""
+    """检测页面是否需要二次认证（如扫码验证）
+
+    新逻辑：必须同时满足
+    1) 存在二维码元素
+    2) 在二维码附近文本或全局文本中命中登录/验证相关关键词
+    仅有二维码不再视为需要二次验证。
+    """
     try:
-        # 检查页面是否包含二次认证相关元素
+        # 1) 先检测二维码元素是否存在
         qr_selectors = [
             "img[src*='qrcode']",
+            "img[src*='qr']",
             ".qrcode",
             "#qrcode",
             "canvas.qrcode",
+            "canvas[id*='qr']",
             "div[class*='qr']",
             "div[id*='qr']",
             "img[alt*='扫码']",
             "img[alt*='二维码']",
         ]
 
-        # 检查是否存在二维码元素
+        has_qr = False
+        matched_selector = None
         for selector in qr_selectors:
-            qr_element = await page.query_selector(selector)
-            if qr_element:
-                print(f"检测到可能的二维码元素: {selector}")
-                return True
+            el = await page.query_selector(selector)
+            if el:
+                has_qr = True
+                matched_selector = selector
+                break
 
-        # 检查页面文本中是否包含二次认证相关词语
-        content = await page.content()
+        if not has_qr:
+            return False
+
+        print(f"检测到二维码元素: {matched_selector}")
+
+        # 2) 在二维码附近与全局文本中查找登录/验证相关关键词
         auth_keywords = [
-            "扫码登录",
-            "扫码验证",
-            "二次验证",
-            "两步验证",
-            "双重认证",
-            "scan qr code",
-            "scan to login",
-            "two-factor",
-            "2fa",
-            "扫描二维码",
-            "扫一扫",
-            "微信扫码",
-            "支付宝扫码",
-            "手机验证",
+            "登录", "扫码登录", "扫码验证", "安全验证", "二次验证", "两步验证", "双重认证",
+            "验证", "身份验证", "校验", "确认登录",
+            "scan to login", "scan qr", "two-factor", "2fa", "verify", "verification",
         ]
 
-        for keyword in auth_keywords:
-            if keyword.lower() in content.lower():
-                print(f"页面内容包含二次认证关键词: {keyword}")
+        # 提取二维码附近文本与全局文本
+        nearby_and_global = await page.evaluate(
+            """
+            (qrSelectors) => {
+              const texts = [];
+              const addText = (t) => { if (t && typeof t === 'string') { const s=t.trim(); if (s) texts.push(s); } };
+              // 全局文本
+              addText(document.body && document.body.innerText);
+
+              // 邻近文本：父级、前后兄弟
+              for (const sel of qrSelectors) {
+                const el = document.querySelector(sel);
+                if (!el) continue;
+                if (el.parentElement) addText(el.parentElement.innerText);
+                if (el.previousElementSibling) addText(el.previousElementSibling.innerText);
+                if (el.nextElementSibling) addText(el.nextElementSibling.innerText);
+              }
+              return texts.join('\n');
+            }
+            """,
+            qr_selectors,
+        )
+
+        text_lc = (nearby_and_global or "").lower()
+        for kw in auth_keywords:
+            if kw.lower() in text_lc:
+                print(f"二维码附近/全局文本命中二次验证关键词: {kw}")
                 return True
 
+        # 未命中任何关键词，不视为二次验证
         return False
     except Exception as e:
         print(f"检查二次认证页面时发生错误: {str(e)}")
