@@ -287,7 +287,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 		),
 		# 预置工具
 		preset_tools.time_tools,
-		preset_tools.file_tools,
+		# preset_tools.file_tools,
 		preset_tools.math_tools,
 		preset_tools.python_tools,
 		preset_tools.shell_tools,
@@ -328,6 +328,17 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 		},
 	)
 	oxy_space.append(audio_mcp)
+
+
+	# File MCP 工具（SenseVoice ASR）
+	file_mcp = oxy.StdioMCPClient(
+		name="file_tools",
+		params={
+			"command": "uv",
+			"args": ["--directory", "./mcp_servers", "run", "file/server.py"],
+		},
+	)
+	oxy_space.append(file_mcp)
 
 	# 过滤掉可能为 None 的工具，避免后续 MAS 初始化时报 'NoneType' 错误
 	oxy_space = [t for t in oxy_space if t is not None]
