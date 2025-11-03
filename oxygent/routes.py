@@ -149,7 +149,20 @@ async def get_node_info(item_id: str):
                 node_data["next_id"] = node_ids[i + 1] if i <= len(node_ids) - 2 else ""
 
                 if "input" in node_data:
-                    node_data["input"] = json.loads(node_data["input"])
+                    try:
+                        node_data["input"] = json.loads(node_data["input"])
+                    except (json.JSONDecodeError, TypeError):
+                        # If input is already a dict or cannot be parsed, use as-is
+                        if not isinstance(node_data["input"], dict):
+                            node_data["input"] = {}
+
+                # Add defensive checks to prevent KeyError
+                if not isinstance(node_data.get("input"), dict):
+                    node_data["input"] = {}
+                if "class_attr" not in node_data["input"]:
+                    node_data["input"]["class_attr"] = {}
+                if "arguments" not in node_data["input"]:
+                    node_data["input"]["arguments"] = {}
 
                 if "prompt" in node_data["input"]["class_attr"]:
                     del node_data["input"]["class_attr"]["prompt"]

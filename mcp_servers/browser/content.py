@@ -5,6 +5,7 @@
 """
 
 import os
+import sys
 import uuid
 from datetime import datetime
 import base64
@@ -209,8 +210,9 @@ async def browser_analyze_screenshot(
                 messages=messages,
                 temperature=0.01,
             )
-            # 返回体输出
-            print("VLM接口返回response:", response)
+            # 返回体输出（使用 stderr 避免干扰 MCP 协议）
+            sys.stderr.write(f"VLM接口返回response: {response}\n")
+            sys.stderr.flush()
             content = ""
             raw_result = None
             if hasattr(response, "choices") and response.choices:
@@ -223,7 +225,8 @@ async def browser_analyze_screenshot(
                     content = choice["message"]["content"]
                     raw_result = choice["message"]
             if not content:
-                print("VLM解析返回空content！response:", str(response)[:500])
+                sys.stderr.write(f"VLM解析返回空content！response: {str(response)[:500]}\n")
+                sys.stderr.flush()
                 await _set_operation_status(False)
                 return {
                     "error": "VLM返回空内容，请检查模型和配额或图片/指令是否合理。", 
@@ -234,7 +237,8 @@ async def browser_analyze_screenshot(
             await _set_operation_status(False)
             return {"result": str(content), "raw": str(raw_result), "path": screenshot_path}
         except Exception as e:
-            print("VLM调用异常：", str(e))
+            sys.stderr.write(f"VLM调用异常：{str(e)}\n")
+            sys.stderr.flush()
             await _set_operation_status(False)
             return {"error": f"VLM SDK调用异常: {str(e)}", "path": screenshot_path}
     except Exception as e:

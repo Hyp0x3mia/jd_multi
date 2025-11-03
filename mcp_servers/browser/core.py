@@ -6,6 +6,7 @@
 
 import asyncio
 import importlib
+import sys
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -75,7 +76,8 @@ async def _ensure_browser():
 
     if _browser is None:
         try:
-            print("浏览器实例不存在，创建新的浏览器实例...")
+            sys.stderr.write("浏览器实例不存在，创建新的浏览器实例...\n")
+            sys.stderr.flush()
             # 动态导入playwright，避免启动时的导入错误
             playwright_module = importlib.import_module("playwright.async_api")
             async_playwright = playwright_module.async_playwright
@@ -83,21 +85,26 @@ async def _ensure_browser():
             playwright = await async_playwright().start()
             _browser = await playwright.chromium.launch(headless=True)
             _context = await _browser.new_context()
-            print("成功创建新的浏览器实例和上下文")
+            sys.stderr.write("成功创建新的浏览器实例和上下文\n")
+            sys.stderr.flush()
 
             # 设置全局请求拦截器，用于检测重定向到登录页面的情况
             await _context.route("**/*", lambda route: route.continue_())
-            print("已设置全局请求拦截器")
+            sys.stderr.write("已设置全局请求拦截器\n")
+            sys.stderr.flush()
         except ImportError:
-            print("导入playwright失败，请安装playwright")
+            sys.stderr.write("导入playwright失败，请安装playwright\n")
+            sys.stderr.flush()
             raise ImportError(
                 "请安装playwright: pip install playwright，然后运行: playwright install"
             )
         except Exception as e:
-            print(f"启动浏览器时发生错误: {str(e)}")
+            sys.stderr.write(f"启动浏览器时发生错误: {str(e)}\n")
+            sys.stderr.flush()
             raise Exception(f"启动浏览器时发生错误: {str(e)}")
     else:
-        print("复用现有浏览器实例")
+        sys.stderr.write("复用现有浏览器实例\n")
+        sys.stderr.flush()
 
 
 async def _ensure_page():
@@ -107,10 +114,12 @@ async def _ensure_page():
     await _ensure_browser()
 
     if not _pages or _current_page_id not in _pages:
-        print("没有可用的页面或当前页面ID无效，创建新页面...")
+        sys.stderr.write("没有可用的页面或当前页面ID无效，创建新页面...\n")
+        sys.stderr.flush()
         # 确保_context已初始化
         if _context is None:
-            print("浏览器上下文未初始化，重新初始化浏览器...")
+            sys.stderr.write("浏览器上下文未初始化，重新初始化浏览器...\n")
+            sys.stderr.flush()
             await _ensure_browser()
 
         # 此时_context应该已经初始化，但为了类型检查，我们再次验证
@@ -120,22 +129,28 @@ async def _ensure_page():
                 page_id = f"page_{len(_pages) + 1}"
                 _pages[page_id] = page
                 _current_page_id = page_id
-                print(f"成功创建新页面，ID: {page_id}")
+                sys.stderr.write(f"成功创建新页面，ID: {page_id}\n")
+                sys.stderr.flush()
 
                 # 设置页面导航事件监听器
                 success = await _setup_navigation_handler(page)
                 if success:
-                    print("成功设置页面导航事件监听器")
+                    sys.stderr.write("成功设置页面导航事件监听器\n")
+                    sys.stderr.flush()
                 else:
-                    print("设置页面导航事件监听器失败，但页面仍可使用")
+                    sys.stderr.write("设置页面导航事件监听器失败，但页面仍可使用\n")
+                    sys.stderr.flush()
             except Exception as e:
-                print(f"创建新页面时发生错误: {str(e)}")
+                sys.stderr.write(f"创建新页面时发生错误: {str(e)}\n")
+                sys.stderr.flush()
                 raise Exception(f"创建新页面时发生错误: {str(e)}")
         else:
-            print("无法初始化浏览器上下文")
+            sys.stderr.write("无法初始化浏览器上下文\n")
+            sys.stderr.flush()
             raise Exception("无法初始化浏览器上下文")
     else:
-        print(f"复用现有页面，ID: {_current_page_id}")
+        sys.stderr.write(f"复用现有页面，ID: {_current_page_id}\n")
+        sys.stderr.flush()
 
     return _pages[_current_page_id]
 
@@ -171,7 +186,8 @@ async def _check_login_required(page):
         ]
         for keyword in url_keywords:
             if keyword in current_url:
-                print(f"URL中包含登录关键词: {keyword}")
+                sys.stderr.write(f"URL中包含登录关键词: {keyword}\n")
+                sys.stderr.flush()
                 return True
 
         # 检查常见的登录元素
@@ -202,7 +218,8 @@ async def _check_login_required(page):
         for selector in login_selectors:
             element = await page.query_selector(selector)
             if element:
-                print(f"检测到登录元素: {selector}")
+                sys.stderr.write(f"检测到登录元素: {selector}\n")
+                sys.stderr.flush()
                 return True
 
         # 检查页面文本中是否包含登录相关词语
@@ -236,12 +253,14 @@ async def _check_login_required(page):
         ]
         for keyword in login_keywords:
             if keyword.lower() in content.lower():
-                print(f"页面内容包含登录关键词: {keyword}")
+                sys.stderr.write(f"页面内容包含登录关键词: {keyword}\n")
+                sys.stderr.flush()
                 return True
 
         return False
     except Exception as e:
-        print(f"检查登录页面时发生错误: {str(e)}")
+        sys.stderr.write(f"检查登录页面时发生错误: {str(e)}\n")
+        sys.stderr.flush()
         return False
 
 
@@ -352,7 +371,8 @@ async def _setup_navigation_handler(page):
 
         return True
     except Exception as e:
-        print(f"设置页面导航事件监听器时发生错误: {str(e)}")
+        sys.stderr.write(f"设置页面导航事件监听器时发生错误: {str(e)}\n")
+        sys.stderr.flush()
         return False
 
 
