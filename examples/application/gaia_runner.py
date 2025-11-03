@@ -779,53 +779,67 @@ async def run_batch(
 	datasets_df = pd.DataFrame(datasets)
 	logger.info(f"To process: {len(datasets)} tasks.")
 
-	results: List[Dict[str, Any]] = []
 	correct_count = 0
 	total_count = 0
 
-	oxy_space = build_oxy_space(enable_mcp=enable_mcp)
-	async with MAS(oxy_space=oxy_space) as mas:
-		for idx, item in datasets_df.iterrows():
-			answer = ""
-			try:
-				question = compose_question(item)
-				if not question:
-					logger.warning(f"Task {item.get('task_id', 'N/A')} has no question field, skipping.")
-					results.append({"error": "no question field", **item.to_dict()})
-					continue
-				
-				# 实际调用 master_agent
-				logger.info(f"Processing task {item.get('task_id', 'N/A')}: {question[:50]}...")
-				resp = await mas.call(callee="master_agent", arguments={"query": question})
-				answer = resp.output if hasattr(resp, "output") else str(resp)
-				
-				# 保存结果
-				save_result(item, answer, result_dir, checkpoint_file, failed_checkpoint_file, is_error=False)
-				results.append({"task_id": item.get('task_id'), "question": question, "answer": answer})
-				
-				# 验证（如果启用）
-				if validate and "answer" in item:
-					total_count += 1
-					expected_answer = item["answer"]
-					if answer == expected_answer:
-						correct_count += 1
-					else:
-						logger.info(f"Task ID: {item.get('task_id', 'N/A')}")
-						logger.info(f"  Expected: {expected_answer}")
-						logger.info(f"  Got:      {answer}")
-				
-			except Exception as e:
-				logger.error(f"Error processing task {item.get('task_id', 'N/A')}: {e}", exc_info=True)
-				save_result(item, str(e), result_dir, checkpoint_file, failed_checkpoint_file, is_error=True)
-				results.append({"task_id": item.get('task_id'), "error": str(e)})
-
-	# 保存结果到 JSONL 文件
-	logger.info(f"Saving {len(results)} results to {output_jsonl_path}")
-	with open(output_jsonl_path, "w", encoding="utf-8") as f:
-		for res in results:
-			f.write(json.dumps(res, ensure_ascii=False) + "\n")
+	# 打开 JSONL 文件用于追加写入（每条任务完成后立即保存）
+	jsonl_file = open(output_jsonl_path, "w", encoding="utf-8")
+	
+	try:
+		oxy_space = build_oxy_space(enable_mcp=enable_mcp)
+		async with MAS(oxy_space=oxy_space) as mas:
+			for idx, item in datasets_df.iterrows():
+				answer = ""
+				result_record = {}
+				try:
+					question = compose_question(item)
+					if not question:
+						logger.warning(f"Task {item.get('task_id', 'N/A')} has no question field, skipping.")
+						result_record = {"error": "no question field", **item.to_dict()}
+						# 立即保存到 JSONL
+						jsonl_file.write(json.dumps(result_record, ensure_ascii=False) + "\n")
+						jsonl_file.flush()
+						continue
+					
+					# 实际调用 master_agent
+					logger.info(f"Processing task {item.get('task_id', 'N/A')}: {question[:50]}...")
+					resp = await mas.call(callee="master_agent", arguments={"query": question})
+					answer = resp.output if hasattr(resp, "output") else str(resp)
+					
+					# 保存结果到 checkpoint 和 Parquet
+					save_result(item, answer, result_dir, checkpoint_file, failed_checkpoint_file, is_error=False)
+					
+					# 构建结果记录
+					result_record = {"task_id": item.get('task_id'), "question": question, "answer": answer}
+					
+					# 立即保存到 JSONL 文件
+					jsonl_file.write(json.dumps(result_record, ensure_ascii=False) + "\n")
+					jsonl_file.flush()
+					
+					# 验证（如果启用）
+					if validate and "answer" in item:
+						total_count += 1
+						expected_answer = item["answer"]
+						if answer == expected_answer:
+							correct_count += 1
+						else:
+							logger.info(f"Task ID: {item.get('task_id', 'N/A')}")
+							logger.info(f"  Expected: {expected_answer}")
+							logger.info(f"  Got:      {answer}")
+					
+				except Exception as e:
+					logger.error(f"Error processing task {item.get('task_id', 'N/A')}: {e}", exc_info=True)
+					save_result(item, str(e), result_dir, checkpoint_file, failed_checkpoint_file, is_error=True)
+					result_record = {"task_id": item.get('task_id'), "error": str(e)}
+					
+					# 立即保存错误结果到 JSONL 文件
+					jsonl_file.write(json.dumps(result_record, ensure_ascii=False) + "\n")
+					jsonl_file.flush()
+	finally:
+		jsonl_file.close()
 
 	# 输出验证统计
+	logger.info(f"Completed processing. Results saved to {output_jsonl_path}")
 	if validate and total_count > 0:
 		accuracy = correct_count / total_count
 		logger.info(f"\n{'='*50}")
@@ -833,8 +847,6 @@ async def run_batch(
 		logger.info(f"  Correct: {correct_count}/{total_count}")
 		logger.info(f"  Accuracy: {accuracy:.4f}")
 		logger.info(f"{'='*50}")
-	else:
-		logger.info(f"Processed {len(results)} tasks. Results saved to {output_jsonl_path}")
 
 
 async def start_web(first_query: Optional[str] = None, enable_mcp: bool = False) -> None:
