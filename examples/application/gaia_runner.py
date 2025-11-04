@@ -3,9 +3,13 @@ import argparse
 import json
 import os
 import unicodedata
-from typing import Any, Dict, List, Optional
+import time
+import requests
+from typing import Any, Dict, List, Optional, Union
+from pathlib import Path
 
 from oxygent import MAS, Config, oxy, preset_tools
+from pydantic import Field
 import importlib.util
 import logging
 logger = logging.getLogger(__name__)
@@ -143,6 +147,8 @@ def _normalize_answer(text: str) -> str:
 	except ValueError:
 		pass
 
+	# 回退：不做激进的数字抽取，交由 normalizer_agent 通过提示词约束
+
 	# 逗号分割处理（按规则去空格）
 	if ',' in text:
 		parts = [p.strip() for p in text.split(',')]
@@ -273,6 +279,736 @@ def _classify_task(query: str) -> str:
 	return 'web'
 
 
+# ==================== GitHub API Tools ====================
+
+def _get_github_headers():
+	"""获取 GitHub API 请求头"""
+	headers = {"Accept": "application/vnd.github.v3+json"}
+	token = os.getenv('GITHUB_TOKEN')
+	if token:
+		headers["Authorization"] = f"Bearer {token}"
+		logger.debug("GitHub token found in environment")
+	else:
+		logger.warning("GITHUB_TOKEN not found in environment - API calls may be rate-limited")
+	return headers
+
+
+def _reduce_keywords_by_priority(keywords: List[str], priority_remove: List[str]) -> List[str]:
+	"""
+	按优先级减少关键词列表
+	
+	Args:
+		keywords: 关键词列表
+		priority_remove: 按优先级排序的移除关键词列表（优先级高的在前）
+	
+	Returns:
+		减少后的关键词列表
+	"""
+	if not keywords:
+		return []
+	
+	import re
+	
+	# 创建关键词的优先级分数（分数越低越优先移除）
+	keyword_scores = {}
+	for i, keyword in enumerate(keywords):
+		score = 100  # 默认分数
+		
+		# 检查是否是优先级移除列表中的关键词
+		for priority_word in priority_remove:
+			if priority_word.lower() in keyword.lower():
+				# 优先级越高（在列表中越靠前），分数越低
+				score = priority_remove.index(priority_word)
+				break
+		
+		# 如果是 issue 编号，分数最高（最不应该移除）
+		if re.match(r'^#?\d+$', keyword):
+			score = 999
+		
+		keyword_scores[keyword] = score
+	
+	# 按分数排序，分数低的优先移除
+	sorted_keywords = sorted(keyword_scores.items(), key=lambda x: x[1])
+	
+	# 移除分数最低的一个关键词
+	if len(sorted_keywords) > 1:
+		# 移除分数最低的关键词
+		removed_keyword = sorted_keywords[0][0]
+		result = [k for k in keywords if k != removed_keyword]
+		logger.debug(f"Removed keyword '{removed_keyword}' (priority: {sorted_keywords[0][1]})")
+		return result
+	
+	return keywords
+
+
+def _normalize_github_query(query: str, reduce_keywords: bool = False) -> str:
+	"""
+	规范化 GitHub 搜索查询，提取关键信息，避免关键词过多
+	
+	策略：
+	1. 优先提取 issue 编号（如 #40054 或 40054）
+	2. 如果包含编号，只返回编号部分（GitHub API 支持直接搜索编号）
+	3. 如果没有编号，提取核心关键词（移除常见停用词）
+	4. 限制关键词数量（最多 2-3 个），避免过度限制导致结果过少
+	5. 如果 reduce_keywords=True，按优先级减少关键词（优先移除日期等不确定性高的）
+	
+	Args:
+		query: 原始查询字符串
+		reduce_keywords: 是否减少关键词（用于重试时减少关键词）
+	"""
+	if not query:
+		return ""
+	
+	import re
+	
+	# 1. 提取 issue 编号（最高优先级）
+	# 匹配 #40054 或 issue #40054 或 issue 40054 等格式
+	# 匹配 4 位以上的数字（通常 issue 编号至少 4 位）
+	issue_number_match = re.search(r'#?(\d{4,})', query)
+	if issue_number_match:
+		issue_number = issue_number_match.group(1)
+		# 如果找到编号，直接返回编号（GitHub API 支持直接搜索编号）
+		return f"#{issue_number}"
+	
+	# 2. 如果没有编号，提取核心关键词
+	# 保留中文字符、英文字母、数字和 # 符号
+	# 移除常见停用词
+	stop_words = {
+		'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+		'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
+		'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+		'could', 'should', 'may', 'might', 'must', 'can', 'about', 'into',
+		'through', 'during', 'including', 'against', 'among', 'throughout',
+		'despite', 'towards', 'upon', 'concerning',
+		# 注意：'bug', 'feature', 'fix' 是重要的搜索关键词，不应该被过滤
+		'github', 'issue', 'pr', 'pull', 'request',
+		'related', 'concerning', 'search', 'find',
+		'look', 'for', 'get', 'show', 'list', 'all', 'open', 'closed'
+	}
+	
+	# 清理查询：保留中文字符、英文字母、数字、# 和空格
+	# 移除其他标点符号
+	cleaned = re.sub(r'[^\w\s#\u4e00-\u9fa5]', ' ', query)
+	words = cleaned.split()
+	
+	# 过滤停用词，保留有意义的关键词
+	# 保留：长度 > 2 的英文单词，或包含中文的词语，或数字
+	# 注意：对于 GitHub Search API，通常将关键词转为小写更安全（虽然 API 不区分大小写，但小写更兼容）
+	keywords = []
+	for w in words:
+		w_lower = w.lower()
+		if not w:
+			continue
+		# 保留中文词语（保持原样）
+		if re.search(r'[\u4e00-\u9fa5]', w):
+			keywords.append(w)
+		# 保留不是停用词且长度 > 2 的英文单词（转为小写）
+		elif w_lower not in stop_words and len(w) > 2:
+			keywords.append(w_lower)  # 转为小写，提高兼容性
+		# 保留数字
+		elif w.isdigit():
+			keywords.append(w)
+	
+	# 如果需要减少关键词，按优先级移除
+	if reduce_keywords and len(keywords) > 1:
+		# 定义优先级移除列表（优先级高的在前，优先移除）
+		priority_remove = [
+			# 日期时间相关（最高优先级移除，不确定性高）
+			'2024', '2025', '2023', '2022', '2021', '2020',
+			'january', 'february', 'march', 'april', 'may', 'june',
+			'july', 'august', 'september', 'october', 'november', 'december',
+			'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec',
+			'月', '年', '日', '天', '周', '星期',
+			'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+			'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun',
+			'today', 'yesterday', 'tomorrow', 'now', 'current',
+			'今天', '昨天', '明天', '现在', '当前',
+			# 时间相关
+			'hour', 'minute', 'second', 'time', 'when', 'during',
+			'小时', '分钟', '秒', '时间', '何时', '期间',
+			# 其他不确定性高的词
+			'about', 'related', 'concerning', 'regarding',
+			'关于', '相关', '有关', '涉及',
+		]
+		
+		keywords = _reduce_keywords_by_priority(keywords, priority_remove)
+	
+	# 限制关键词数量（最多 4 个核心关键词，避免过度限制导致结果过少）
+	# 从 2 个增加到 4 个，因为像 "whisper audio bug" 这样的常见查询需要多个关键词
+	if not reduce_keywords and len(keywords) > 4:
+		# 优先保留包含中文的词语，然后按长度排序
+		chinese_keywords = [k for k in keywords if re.search(r'[\u4e00-\u9fa5]', k)]
+		english_keywords = [k for k in keywords if k not in chinese_keywords]
+		
+		# 保留中文关键词 + 最长的英文关键词（最多 4 个）
+		if chinese_keywords:
+			keywords = chinese_keywords[:2] + sorted(english_keywords, key=len, reverse=True)[:2]
+		else:
+			keywords = sorted(english_keywords, key=len, reverse=True)[:4]
+	
+	# 返回清理后的查询（用空格连接）
+	result = " ".join(keywords) if keywords else ""
+	return result
+
+
+def _execute_github_search(
+	headers: Dict,
+	query_terms: List[str],
+	max_results: int
+) -> List[Dict]:
+	"""
+	执行 GitHub API 搜索请求
+	
+	Args:
+		headers: HTTP 请求头
+		query_terms: 查询条件列表
+		max_results: 最大结果数
+	
+	Returns:
+		搜索结果列表
+	"""
+	# GitHub Search API 查询格式：repo:owner/name is:issue|is:pull-request 关键词1 关键词2
+	# 多个关键词用空格分隔，requests 会自动进行 URL 编码
+	search_query = " ".join(query_terms)
+	logger.info(f"Executing GitHub search query: {search_query}")
+	logger.info(f"Query terms breakdown: {query_terms}")
+	
+	all_items = []
+	per_page = min(100, max_results)
+	
+	try:
+		# GitHub Search API 不支持 page 参数，只返回第一页的结果（最多 1000 个）
+		# 但我们可以通过调整 per_page 来获取更多结果
+		# requests 库会自动对 params 进行 URL 编码，所以 "whisper audio bug" 会被编码为 "whisper%20audio%20bug"
+		params = {
+			"q": search_query,
+			"per_page": per_page,
+			"sort": "updated",
+			"order": "desc"
+		}
+		
+		logger.debug(f"Request params: {params}")
+		logger.info(f"Equivalent web URL format: https://github.com/{query_terms[0].replace('repo:', '')}/issues?q={'%20'.join(query_terms[1:]) if len(query_terms) > 1 else ''}")
+		
+		# 构建完整的请求 URL（用于调试）
+		url = "https://api.github.com/search/issues"
+		response = requests.get(
+			url,
+			headers=headers,
+			params=params,
+			timeout=30
+		)
+		
+		# 记录完整的请求 URL（用于调试）
+		request_url = response.url if hasattr(response, 'url') else url
+		logger.debug(f"Full request URL: {request_url}")
+		
+		# 记录响应状态和详细信息
+		logger.debug(f"GitHub API response status: {response.status_code}")
+		logger.debug(f"GitHub API response headers: {dict(response.headers)}")
+		
+		# 处理速率限制
+		if response.status_code == 403:
+			reset_time = int(response.headers.get("X-RateLimit-Reset", time.time() + 60))
+			sleep_time = max(reset_time - time.time(), 0) + 5
+			logger.warning(f"GitHub rate limit reached, sleeping {sleep_time:.1f} seconds")
+			time.sleep(sleep_time)
+			# 重试一次
+			response = requests.get(
+				"https://api.github.com/search/issues",
+				headers=headers,
+				params=params,
+				timeout=30
+			)
+		
+		# 处理其他错误状态码
+		if response.status_code != 200:
+			error_msg = f"GitHub API returned status {response.status_code}"
+			try:
+				error_data = response.json()
+				if "message" in error_data:
+					error_msg += f": {error_data['message']}"
+				if "errors" in error_data:
+					error_msg += f" - Errors: {error_data['errors']}"
+				logger.error(error_msg)
+				logger.error(f"Response body: {response.text[:500]}")
+			except:
+				logger.error(f"{error_msg}. Response: {response.text[:500]}")
+			return []
+		
+		response.raise_for_status()
+		data = response.json()
+		
+		# 记录搜索结果统计
+		total_count = data.get("total_count", 0)
+		incomplete_results = data.get("incomplete_results", False)
+		items = data.get("items", [])
+		
+		logger.info(f"GitHub search returned {len(items)} items (total: {total_count}, incomplete: {incomplete_results})")
+		
+		if incomplete_results:
+			logger.warning("GitHub search results are incomplete (may have timed out)")
+		
+		# 返回请求的结果数量
+		all_items = items[:max_results]
+		
+		if not all_items:
+			logger.warning(f"No items found for query: {search_query}")
+			logger.warning(f"Query terms: {query_terms}")
+			logger.warning(f"Total count from API: {total_count}")
+			# 如果 total_count > 0 但 items 为空，可能是数据格式问题
+			if total_count > 0:
+				logger.error(f"API reports {total_count} items but returned empty list - possible API issue")
+				logger.debug(f"Full API response: {json.dumps(data, indent=2)[:1000]}")
+		else:
+			# 记录前几个结果的标题，用于验证
+			result_titles = [item.get("title", "N/A")[:50] for item in all_items[:3]]
+			logger.info(f"Sample result titles: {result_titles}")
+		
+		# 确保返回的数据是列表格式，且每个项目都是字典
+		if all_items and isinstance(all_items[0], dict):
+			logger.debug(f"Returning {len(all_items)} items with correct format")
+		else:
+			logger.error(f"Unexpected data format: {type(all_items[0]) if all_items else 'empty'}")
+		
+		return all_items
+		
+	except requests.RequestException as e:
+		logger.error(f"GitHub search request failed: {e}")
+		logger.error(f"Query: {search_query}")
+		return []
+	except Exception as e:
+		logger.error(f"GitHub search unexpected error: {e}", exc_info=True)
+		logger.error(f"Query: {search_query}")
+		return []
+
+
+def _search_github_issues(
+	repo: str,
+	query: str = "",
+	state: str = "all",
+	issue_type: str = "all",
+	max_results: int = 10
+) -> List[Dict]:
+	"""
+	使用 GitHub Search API 搜索 issues 和 PRs
+	
+	如果第一次搜索没有结果，会自动减少关键词（优先移除日期等不确定性高的词）并重试。
+	
+	Args:
+		repo: Repository in owner/repo format
+		query: Search query string (e.g., "#40054", "bug", "audio whisper")
+		state: Issue state (open/closed/all)
+		issue_type: Type (issue/pr/all)
+		max_results: Maximum number of results to return
+	
+	Returns:
+		List of issue/PR dictionaries
+	"""
+	headers = _get_github_headers()
+	
+	# 构建基础查询条件
+	# 注意：GitHub Search API 不支持 state:all，只支持 state:open 和 state:closed
+	# 如果要搜索所有状态，不添加 state 条件即可（默认会搜索所有状态）
+	base_query_terms = [f"repo:{repo}"]
+	
+	# 只有当 state 不是 "all" 时才添加 state 条件
+	if state != "all":
+		base_query_terms.append(f"state:{state}")
+	
+	if issue_type == "pr":
+		base_query_terms.append("is:pull-request")
+	elif issue_type == "issue":
+		base_query_terms.append("is:issue")
+	else:
+		# GitHub Search API 要求必须包含 is:issue 或 is:pull-request；
+		# 默认按 issue 搜索（常见需求），确保不触发 422。
+		base_query_terms.append("is:issue")
+	
+	# 第一次尝试：使用规范化后的完整查询
+	if query:
+		normalized_query = _normalize_github_query(query, reduce_keywords=False)
+		if normalized_query:
+			query_terms = base_query_terms + [normalized_query]
+			logger.debug(f"Initial normalized GitHub query: '{query}' -> '{normalized_query}'")
+		else:
+			query_terms = base_query_terms
+			logger.debug(f"GitHub query normalized to empty: '{query}'")
+	else:
+		query_terms = base_query_terms
+	
+	# 第一次搜索
+	results = _execute_github_search(headers, query_terms, max_results)
+	
+	# 如果第一次搜索没有结果，且查询包含关键词，尝试减少关键词并重试
+	if not results and query:
+		original_normalized = _normalize_github_query(query, reduce_keywords=False)
+		if original_normalized and len(original_normalized.split()) > 1:
+			logger.info(f"No results found with query '{original_normalized}', trying to reduce keywords...")
+			
+			# 提取关键词列表（用于逐步减少）
+			import re
+			stop_words = {
+				'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+				'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
+				'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+				'could', 'should', 'may', 'might', 'must', 'can', 'about', 'into',
+				'through', 'during', 'including', 'against', 'among', 'throughout',
+				'despite', 'towards', 'upon', 'concerning',
+				# 注意：'bug', 'feature', 'fix' 是重要的搜索关键词，不应该被过滤
+				'github', 'issue', 'pr', 'pull', 'request',
+				'related', 'concerning', 'search', 'find',
+				'look', 'for', 'get', 'show', 'list', 'all', 'open', 'closed'
+			}
+			
+			cleaned = re.sub(r'[^\w\s#\u4e00-\u9fa5]', ' ', query)
+			words = cleaned.split()
+			keywords = []
+			for w in words:
+				w_lower = w.lower()
+				if not w:
+					continue
+				if re.search(r'[\u4e00-\u9fa5]', w):
+					keywords.append(w)
+				elif w_lower not in stop_words and len(w) > 2:
+					keywords.append(w_lower)  # 转为小写，与主函数保持一致
+				elif w.isdigit():
+					keywords.append(w)
+			
+			# 限制初始关键词数量（最多 4 个，与主函数保持一致）
+			if len(keywords) > 4:
+				chinese_keywords = [k for k in keywords if re.search(r'[\u4e00-\u9fa5]', k)]
+				english_keywords = [k for k in keywords if k not in chinese_keywords]
+				if chinese_keywords:
+					keywords = chinese_keywords[:2] + sorted(english_keywords, key=len, reverse=True)[:2]
+				else:
+					keywords = sorted(english_keywords, key=len, reverse=True)[:4]
+			
+			# 优先级移除列表
+			priority_remove = [
+				'2024', '2025', '2023', '2022', '2021', '2020',
+				'january', 'february', 'march', 'april', 'may', 'june',
+				'july', 'august', 'september', 'october', 'november', 'december',
+				'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec',
+				'月', '年', '日', '天', '周', '星期',
+				'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+				'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun',
+				'today', 'yesterday', 'tomorrow', 'now', 'current',
+				'今天', '昨天', '明天', '现在', '当前',
+				'hour', 'minute', 'second', 'time', 'when', 'during',
+				'小时', '分钟', '秒', '时间', '何时', '期间',
+				'about', 'related', 'concerning', 'regarding',
+				'关于', '相关', '有关', '涉及',
+			]
+			
+			# 逐步减少关键词，最多重试 3 次
+			current_keywords = keywords.copy()
+			for attempt in range(3):
+				if len(current_keywords) <= 1:
+					logger.debug(f"Only 1 or 0 keywords left, cannot reduce further")
+					break
+				
+				# 减少关键词
+				current_keywords = _reduce_keywords_by_priority(current_keywords, priority_remove)
+				
+				if not current_keywords:
+					logger.debug(f"No keywords left after reduction, stopping retry")
+					break
+				
+				# 构建新的查询
+				reduced_query = " ".join(current_keywords)
+				query_terms = base_query_terms + [reduced_query]
+				logger.info(f"Retry attempt {attempt + 1}: using reduced query '{reduced_query}' (keywords: {current_keywords})")
+				
+				# 重试搜索
+				results = _execute_github_search(headers, query_terms, max_results)
+				
+				if results:
+					logger.info(f"Found {len(results)} results with reduced query '{reduced_query}'")
+					break
+	
+	return results
+
+
+def _get_github_issue_by_number(
+	repo: str,
+	issue_number: int
+) -> Optional[Dict]:
+	"""
+	通过 issue 编号获取详细信息
+	
+	Args:
+		repo: Repository in owner/repo format
+		issue_number: Issue/PR number
+	
+	Returns:
+		Issue/PR dictionary or None
+	"""
+	headers = _get_github_headers()
+	
+	try:
+		url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
+		response = requests.get(url, headers=headers, timeout=30)
+		
+		if response.status_code == 403:
+			reset_time = int(response.headers.get("X-RateLimit-Reset", time.time() + 60))
+			sleep_time = max(reset_time - time.time(), 0) + 5
+			logger.warning(f"GitHub rate limit reached, sleeping {sleep_time:.1f} seconds")
+			time.sleep(sleep_time)
+			response = requests.get(url, headers=headers, timeout=30)
+		
+		response.raise_for_status()
+		return response.json()
+		
+	except requests.RequestException as e:
+		logger.error(f"Failed to get GitHub issue #{issue_number}: {e}")
+		return None
+
+
+# 创建新版 GitHub API 工具（稳定方案）
+github_api_tools = oxy.FunctionHub(name="github_api_tools", timeout=120)
+
+
+@github_api_tools.tool(description="Github.SearchIssues: Search issues/PRs via REST API with structured params")
+def github_search_issues(
+    repo: str = Field("", description="Repository in owner/repo. Optional if q_extra already includes repo: qualifier"),
+    labels: str = Field("", description="Comma-separated labels (OR semantics)"),
+    milestone: str = Field("", description="Milestone title or number"),
+    created: str = Field("", description="created date range, e.g., '2025-01-01..2025-12-31'"),
+    updated: str = Field("", description="updated date range, e.g., '2025-01-01..2025-12-31'"),
+    in_: str = Field("", description="Search fields, e.g., 'title,body'"),
+    state: str = Field("all", description="open|closed|all"),
+    q_extra: str = Field("", description="Extra free-text query qualifiers, e.g., 'whisper audio bug'"),
+    per_page: int = Field(10, description="results per page (<=100)"),
+    page: int = Field(1, description="page number")
+) -> List[Dict]:
+    """
+    Build GitHub search query and call /search/issues. Fallback: if only repo provided with no text, add 'is:issue'.
+    Returns a list of structured items with minimal fields for downstream use.
+    """
+    headers = _get_github_headers()
+    per_page = max(1, min(100, per_page))
+    terms: List[str] = []
+    if repo:
+        terms.append(f"repo:{repo}")
+    # state qualifier (skip if all)
+    if state and state.lower() != "all":
+        terms.append(f"state:{state.lower()}")
+    # labels (OR semantics via multiple label: qualifiers)
+    if labels:
+        for lb in [s.strip() for s in labels.split(',') if s.strip()]:
+            terms.append(f"label:{lb}")
+    if milestone:
+        terms.append(f"milestone:{milestone}")
+    if created:
+        terms.append(f"created:{created}")
+    if updated:
+        terms.append(f"updated:{updated}")
+    if in_:
+        # support comma list
+        for field in [s.strip() for s in in_.split(',') if s.strip()]:
+            terms.append(f"in:{field}")
+    if q_extra:
+        terms.append(q_extra)
+    # API requires is:issue|is:pull-request when no free-text sometimes; add is:issue by default
+    if not any(t.startswith("is:") for t in terms):
+        terms.append("is:issue")
+
+    query = " ".join(terms)
+    logger.info(f"Github.SearchIssues → q={query}")
+    params = {"q": query, "per_page": per_page, "page": page, "sort": "updated", "order": "desc"}
+    try:
+        resp = requests.get("https://api.github.com/search/issues", headers=headers, params=params, timeout=30)
+        if resp.status_code == 403:
+            logger.warning("Rate limit hit for GitHub API search")
+        if resp.status_code != 200:
+            logger.error(f"Github.SearchIssues HTTP {resp.status_code}: {resp.text[:300]}")
+            return []
+        data = resp.json()
+        items = data.get("items", [])
+        results = []
+        for it in items:
+            results.append({
+                "number": it.get("number"),
+                "title": it.get("title"),
+                "state": it.get("state"),
+                "html_url": it.get("html_url"),
+                "created_at": it.get("created_at"),
+                "updated_at": it.get("updated_at"),
+                "labels": [lb.get("name") for lb in it.get("labels", [])],
+                "repository_url": it.get("repository_url"),
+            })
+        # evidence log
+        logger.info(f"Github.SearchIssues results: {[r.get('number') for r in results[:5]]}")
+        return results
+    except Exception as e:
+        logger.error(f"Github.SearchIssues error: {e}")
+        return []
+
+
+@github_api_tools.tool(description="Github.GetIssue: Get full issue/PR by number in a repo")
+def github_get_issue(
+    repo: str = Field(..., description="owner/repo"),
+    number: int = Field(..., description="issue or PR number")
+) -> Dict:
+    headers = _get_github_headers()
+    url = f"https://api.github.com/repos/{repo}/issues/{number}"
+    logger.info(f"Github.GetIssue → {url}")
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            logger.error(f"Github.GetIssue HTTP {resp.status_code}: {resp.text[:300]}")
+            return {"error": f"HTTP {resp.status_code}"}
+        it = resp.json()
+        return {
+            "number": it.get("number"),
+            "title": it.get("title"),
+            "state": it.get("state"),
+            "html_url": it.get("html_url"),
+            "created_at": it.get("created_at"),
+            "updated_at": it.get("updated_at"),
+            "body": it.get("body", ""),
+            "labels": [lb.get("name") for lb in it.get("labels", [])],
+            "assignees": [u.get("login") for u in it.get("assignees", [])],
+        }
+    except Exception as e:
+        logger.error(f"Github.GetIssue error: {e}")
+        return {"error": str(e)}
+
+
+# Guardrails: GithubQueryBuilder
+github_guardrails = oxy.FunctionHub(name="github_guardrails", timeout=60)
+
+
+@github_guardrails.tool(description="Guardrails.GithubQueryBuilder: turn user intent into API params and plan")
+def github_query_builder(userIntent: str = Field(..., description="natural language intent")) -> Dict:
+    """A lightweight heuristic planner that extracts repo, labels, state, in-fields and keywords.
+    Returns plan dict with {repo, state, labels, in, q_extra, notes}.
+    """
+    intent = (userIntent or "").strip()
+    repo = ""
+    import re
+    m = re.search(r"([\w-]+/[\w.-]+)", intent)
+    if m:
+        repo = m.group(1)
+    # labels like label:bug or 关键词 bug
+    labels = []
+    for lb in re.findall(r"label:([\w-]+)", intent, flags=re.I):
+        labels.append(lb)
+    # if contains words bug/feature/regression add as label candidates (best-effort)
+    for kw, tag in [("bug", "bug"), ("regression", "regression"), ("feature", "feature")]:
+        if re.search(rf"\b{kw}\b", intent, flags=re.I):
+            if tag not in labels:
+                labels.append(tag)
+    state = "all"
+    if re.search(r"\bclosed\b", intent, flags=re.I):
+        state = "closed"
+    elif re.search(r"\bopen\b", intent, flags=re.I):
+        state = "open"
+    in_fields = []
+    if re.search(r"title|标题", intent):
+        in_fields.append("title")
+    if re.search(r"body|正文|内容", intent):
+        in_fields.append("body")
+    if not in_fields:
+        in_fields = ["title"]
+    # q_extra: remaining words without repo/label/state tokens
+    words = re.sub(r"([\w-]+/[\w.-]+)|label:[\w-]+|\b(open|closed|all)\b", " ", intent, flags=re.I)
+    q_extra = " ".join(w for w in words.split() if w)
+    plan = {
+        "repo": repo,
+        "state": state,
+        "labels": ",".join(labels),
+        "in": ",".join(in_fields),
+        "q_extra": q_extra,
+        "notes": "Plan built by guardrails to feed Github.SearchIssues."
+    }
+    logger.info(f"GithubQueryBuilder plan: {plan}")
+    return plan
+
+
+# Sanity tools
+sanity_tools = oxy.FunctionHub(name="sanity_tools", timeout=30)
+
+
+@sanity_tools.tool(description="Sanity.ValidateAnswer: validate and normalize output by schema")
+def sanity_validate_answer(answer: str = Field(..., description="raw answer"), schema: str = Field("text", description="one of: url, number, filename, text")) -> Dict:
+    import re
+    a = (answer or "").strip()
+    ok = True
+    norm = a
+    if schema == "url":
+        ok = bool(re.match(r"^https?://[\w\-.:/?#%&=+@~]+$", a))
+    elif schema == "number":
+        m = re.match(r"^\s*([+-]?(?:\d+\.?\d*|\d*\.?\d+))\s*$", a)
+        ok = bool(m)
+        if m:
+            norm = m.group(1)
+    elif schema == "filename":
+        ok = bool(re.match(r"^[\w\-_.]+(\.[\w\-_.]+)?$", a))
+    return {"ok": ok, "normalized": norm}
+
+
+@github_api_tools.tool(description="Search GitHub issues and PRs by repository, query, state, and type")
+def search_github_issues(
+	repo: str = Field(..., description="Repository name in owner/repo format (e.g., 'huggingface/transformers')"),
+	query: str = Field("", description="Search query string (e.g., '#40054', 'audio whisper', 'bug')"),
+	state: str = Field("all", description="Issue state", enum=["open", "closed", "all"]),
+	issue_type: str = Field("all", description="Type of items", enum=["issue", "pr", "all"]),
+	max_results: int = Field(10, description="Maximum number of results to return", ge=1, le=100)
+) -> List[Dict]:
+	"""
+	Search GitHub issues and PRs using GitHub Search API.
+	
+	This tool is particularly useful for finding specific issues by number (e.g., '#40054'),
+	searching by keywords, or filtering by state and type.
+	
+	Examples:
+		- search_github_issues(repo="huggingface/transformers", query="#40054", state="all")
+		- search_github_issues(repo="pytorch/pytorch", query="audio whisper", state="closed", issue_type="issue")
+	"""
+	logger.info(f"search_github_issues called with: repo={repo}, query={query}, state={state}, issue_type={issue_type}, max_results={max_results}")
+	
+	try:
+		results = _search_github_issues(
+			repo=repo,
+			query=query,
+			state=state,
+			issue_type=issue_type,
+			max_results=max_results
+		)
+		
+		logger.info(f"search_github_issues returning {len(results)} results")
+		if results:
+			logger.debug(f"First result sample: {json.dumps(results[0], indent=2)[:500]}")
+		
+		# 确保返回的是可序列化的列表
+		return results if results else []
+		
+	except Exception as e:
+		logger.error(f"Error in search_github_issues: {e}", exc_info=True)
+		return []
+
+
+@github_api_tools.tool(description="Get detailed information about a specific GitHub issue or PR by number")
+def get_github_issue(
+	repo: str = Field(..., description="Repository name in owner/repo format"),
+	issue_number: int = Field(..., description="Issue or PR number")
+) -> Dict:
+	"""
+	Get detailed information about a specific GitHub issue or PR by its number.
+	
+	This tool retrieves full details including title, body, comments, labels, state, etc.
+	
+	Example:
+		- get_github_issue(repo="huggingface/transformers", issue_number=40054)
+	"""
+	result = _get_github_issue_by_number(repo=repo, issue_number=issue_number)
+	if result is None:
+		return {"error": f"Issue #{issue_number} not found or API request failed"}
+	return result
+
+
 def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 	"""构建OxyGent空间，包含所有智能体和工具"""
 	Config.set_agent_llm_model("default_llm")
@@ -348,6 +1084,12 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 		oxy_space.append(preset_tools.baidu_search_tools)
 	except Exception as e:
 		print(f"Warning: Could not add baidu_search_tools: {e}")
+	
+	# 禁用 GitHub 搜索工具（按用户要求）
+	# try:
+	# 	oxy_space.append(github_tools)
+	# except Exception as e:
+	# 	logger.warning(f"Could not add github_tools: {e}")
 
 	# PDF analyze tool removed per user request
 
@@ -375,6 +1117,11 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 		},
 	)
 	oxy_space.append(audio_mcp)
+
+	# 注册新版 GitHub 稳定 API 工具与 Guardrails/Sanity（供 web_agent 优先使用）
+	oxy_space.append(github_api_tools)
+	oxy_space.append(github_guardrails)
+	oxy_space.append(sanity_tools)
 
 
 	# File MCP 工具（SenseVoice ASR）
@@ -440,12 +1187,13 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 		)
 	)
 	
-	# WebAgent：网页信息提取与搜索（集成浏览器工具）
-	web_tools = ["http_tools"]
+	# WebAgent：网页信息提取与搜索（优先 GitHub API/URL，其次浏览器）
+	web_tools = ["http_tools", "github_api_tools", "github_guardrails", "sanity_tools"]
 	if "baidu_search_tools" in available_tools:
 		web_tools.append("baidu_search_tools")
 	if "browser_tools" in available_tools:
 		web_tools.append("browser_tools")
+	# 旧版 github_tools 已禁用，统一使用 github_api_tools
 	
 	oxy_space.append(
 		oxy.ReActAgent(
@@ -455,18 +1203,69 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			llm_model="default_llm",
 			additional_prompt=(
 				"ROLE: Web + Browser Specialist\n"
-				"TOOLS: http_tools, baidu_search_tools (if available), browser_tools (navigate/click/snapshot), browser_analyze_screenshot (VLM).\n"
+				"TOOLS: http_tools; github_api_tools (Github.SearchIssues, Github.GetIssue); github_guardrails (GithubQueryBuilder); sanity_tools (ValidateAnswer); baidu_search_tools (if available); browser_tools (navigate/click/snapshot); browser_analyze_screenshot (VLM).\n"
 				"FLOW:\n"
-				"1) Search authoritative sources (official sites, Wikipedia, GitHub).\n"
-				"2) Open page and extract target facts deterministically.\n"
-				"3) If visual content required (text in image, buttons, tables), call browser_analyze_screenshot with a precise, minimal prompt.\n"
+				"1) For GitHub tasks, FIRST use GithubQueryBuilder → Github.SearchIssues → (optional) Github.GetIssue. Compose URL issues?q=... as needed.\n"
+				"2) ANALYZE results BEFORE taking further action:\n"
+				"   - If search_github_issues returns results, READ and ANALYZE them immediately.\n"
+				"   - Check if the results already contain the answer to the query.\n"
+				"   - If yes, extract the answer from the results and STOP (do NOT search again).\n"
+				"   - If results reference a specific issue, open that issue page via browser and extract details.\n"
+				"   - DO NOT repeat the same search - analyze existing results first.\n"
+				"3) Open page(s) and extract target facts deterministically (only if search results don't contain the answer).\n"
+				"   - When using browser_navigate, prefer wait_until='domcontentloaded' to reduce waiting time.\n"
+				"   - Use full-page screenshots when the target may appear outside the initial viewport; otherwise prefer minimal screenshots.\n"
+				"4) If visual content required (text in image, buttons, tables), call browser_analyze_screenshot with a precise, minimal prompt.\n"
 				"POLICY:\n"
-				"- Keep steps minimal: search → open → extract.\n"
+				"- Keep steps minimal: search → analyze results → extract → STOP.\n"
 				"- Prefer primary sources and exact matches.\n"
+				"- CRITICAL: After calling search_github_issues and getting results, ANALYZE the results first before taking any further action.\n"
+				"  * If the results contain the answer, extract it and return immediately - DO NOT search again.\n"
+				"  * If you need more details about a specific issue from the results, use get_github_issue with the issue number.\n"
+				"  * NEVER repeat the same search with identical or similar parameters - it wastes time and returns the same results.\n"
+				"- For GitHub searches: Prefer API → else encoded URL → else browser.\n"
+				"CRITICAL - INFORMATION VERIFICATION:\n"
+				"- Information from web pages may be incomplete, outdated, or incorrect.\n"
+				"- ALWAYS verify extracted information by:\n"
+				"  1) Cross-checking with page source or multiple locations on the same page\n"
+				"  2) Using browser_snapshot or browser_analyze_screenshot to visually confirm text matches\n"
+				"  3) If multiple sources available, prefer official/authoritative sources\n"
+				"  4) If information seems ambiguous, extract from the most prominent/clear location\n"
+				"- When extracting specific values (dates, numbers, names, URLs), be precise and verify the exact text.\n"
+				"- If the extracted information doesn't seem to match the query, try alternative extraction methods or re-read the page.\n"
+				"BROWSER ELEMENT LOCATION STRATEGY:\n"
+				"- Use robust locators (getByRole/getByLabel/getByText). Avoid raw CSS/XPath. If needed: \n"
+				"  1) Take a screenshot first using browser_take_screenshot to see the current page state\n"
+				"  2) Use browser_analyze_screenshot to identify elements by visual description (e.g., 'the search box at the top', 'the filter button labeled All')\n"
+				"  3) Try more generic selectors (e.g., 'input[type=\"text\"]' instead of 'input[name=\"q\"]')\n"
+				"  4) Try text-based selectors (e.g., 'text=All' or 'button:has-text(\"All\")') if supported\n"
+				"  5) Use browser_snapshot to get accessibility tree and find elements by accessible name\n"
+				"- When clicking elements, verify success by:\n"
+				"  * Taking a screenshot after click to confirm the page state changed\n"
+				"  * Checking URL changes or page content updates\n"
+				"- If element location fails multiple times:\n"
+				"  * Re-examine the page structure with browser_snapshot\n"
+				"  * Try browser_analyze_screenshot with a detailed prompt about the element location\n"
+				"  * Consider using browser navigation (browser_navigate) with direct URL if possible\n"
 				"CRITICAL FOR GITHUB ISSUES:\n"
-				"- When searching GitHub issues (e.g., 'issue #12345', 'GitHub issue'), GitHub by default shows only OPEN issues.\n"
-				"- If the query asks about an issue (especially with a number like '#40054') and you cannot find it, it may be CLOSED.\n"
-				"- PREFERRED METHOD: Use GitHub's search box with filter syntax (RECOMMENDED - avoids clicking multiple buttons).\n"
+				"- When searching GitHub issues (e.g., 'issue #12345', 'GitHub issue'), ALWAYS use github_api_tools FIRST if available.\n"
+				"- WORKFLOW AFTER SEARCH (CRITICAL - DO NOT REPEAT SEARCHES):\n"
+				"  1) Use browser to search ONCE on GitHub issues page with proper filters.\n"
+				"  2) If search returns results, ANALYZE the results immediately:\n"
+				"     * Check if the results contain the information needed to answer the query.\n"
+				"     * If yes, extract the answer from the search results and STOP (do NOT search again).\n"
+				"     * If the results mention a specific issue number but lack details, open that issue page and extract details.\n"
+				"  3) If search returns empty results, try reducing keywords and retry ONCE.\n"
+				"  4) NEVER repeat the same search with identical parameters - it will return the same results.\n"
+				"  5) If you need more information about a specific issue from search results, open that issue page directly instead of searching again.\n"
+				"- Example workflow:\n"
+				"  Query: 'Audio Whisper bug in transformers'\n"
+				"  Step 1: search_github_issues(repo='huggingface/transformers', query='audio whisper bug', state='all') → Returns list of issues\n"
+				"  Step 2: Analyze returned issues - if they contain the answer, extract and return. If need details, use get_github_issue for specific issue.\n"
+				"  Step 3: STOP - do NOT search again with the same or similar query.\n"
+				"- FALLBACK METHOD (if github_api_tools not available): Use browser automation with GitHub's search box.\n"
+				"- If the query asks about an issue (especially with a number like '#40054') and you cannot find it, it may be CLOSED - use state='all' in search_github_issues.\n"
+				"- BROWSER METHOD (if API not available): Use GitHub's search box with filter syntax (RECOMMENDED - avoids clicking multiple buttons).\n"
 				"- GitHub Issues search supports filter syntax in the search box:\n"
 				"  * 'is:all #40054' - Search all issues (open and closed) with number 40054\n"
 				"  * 'is:issue is:closed #40054' - Search closed issues with number 40054\n"
@@ -498,7 +1297,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"  * Question: '六个板块叫什么？请仅用英文逗号间隔输出' → Output: '京东金条,白条,京东小金库,基金,保险,更多服务'\n"
 				"- Return ONLY the requested fact/value in the requested format; no extra commentary, no descriptions.\n"
 			),
-			timeout=120,
+				timeout=300,
 		)
 	)
 
@@ -514,7 +1313,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			name="file_agent",
 			desc="File Specialist – identify, parse and extract from local files.",
 			tools=file_tools_list,
-			llm_model="zai-org/GLM-4.5",
+			llm_model="vision_llm",
 			additional_prompt=(
 				"ROLE: File Specialist\n"
 				"SCOPE: Extract content FROM files (text from PDFs, images, documents).\n"
@@ -524,7 +1323,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- If task asks to count files/list directory items, return the UNABLE_TO_PROCESS message above.\n"
 				"OUTPUT: Return only the minimal text/value(s) required by the question, OR the UNABLE_TO_PROCESS message if task is outside scope.\n"
 			),
-			timeout=120,
+			timeout=300,
 		)
 	)
 
@@ -633,8 +1432,17 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- If candidate_answer is already correct, return it unchanged (only clean formatting).\n"
 				"\n"
 				"RULES:\n"
-				"- Remove explanations/reasoning/units not requested/decoration.\n"
-				"- If answer is a single number and no special format is required: return digits ONLY (no re-calculation).\n"
+				"- Remove ALL explanations/reasoning/units/prefix/suffix unless explicitly requested.\n"
+				"- If the expected answer is a single number (integer/decimal/negative) and no special format is required:\n"
+				"  RETURN DIGITS ONLY (keep minus sign and decimal point if present). No words, no units, no extra characters.\n"
+				"  Examples: '答案是 42 人' → '42'; '≈ 3.140' → '3.14'; '- 0012 ' → '-12'.\n"
+				"- If candidate_answer contains both number and text, EXTRACT ONLY the numeric value unless the question demands text.\n"
+				"- COUNT-STYLE QUESTIONS (数量/多少/几 + 个/项/文件/log 等): If multiple numbers appear, select ONE most plausible count without recalculation:\n"
+				"  * Prefer the number immediately following cues like '共/共有/数量为/总计'.\n"
+				"  * Otherwise prefer a positive integer within [1, 1000] (choose the largest if multiple).\n"
+				"  * If none match, fall back to the last number in candidate_answer.\n"
+				"  * Ignore file paths, years, IDs when evidently unrelated to the asked count.\n"
+				"- If a list of numbers is requested, output numbers only using the requested separator; otherwise default to ','.\n"
 				"- Normalize whitespace + NFKC; trim trailing zeros when appropriate.\n"
 				"- FORMAT EXTRACTION (CRITICAL):\n"
 				"  * If question requests a specific format (e.g., 'comma-separated', '仅用英文逗号间隔', '以逗号分隔'), extract items from candidate_answer and output in that format.\n"
@@ -645,7 +1453,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"  * If question says '仅用英文逗号间隔' or 'comma-separated', use ',' (no space).\n"
 				"- Dates: honor requested format; default to YYYY-MM-DD.\n"
 				"- Chinese answers: preserve wording strictly.\n"
-				"- If specific form requested (word/URL/name), output ONLY that content.\n"
+				"- If specific form requested (word/URL/name/number), output ONLY that content.\n"
 				"\n"
 				"EXAMPLES:\n"
 				"- Input: candidate_answer='11', question='sum of digits'. Output: '11' (NOT '2', because 11 is already the final answer).\n"
@@ -654,6 +1462,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- Input: candidate_answer='第一行：1. 京东金条...\\n2. 白条...', question='仅用英文逗号间隔输出六个板块名称'. Output: '京东金条,白条,京东小金库,基金,保险,更多服务'\n"
 				"\n"
 				"OUTPUT: Return ONLY the normalized answer, no prefixes/suffixes/extra lines. NO recalculation.\n"
+				"If the question expects a number but candidate contains additional words, DROP ALL WORDS and return ONLY the number.\n"
 				"\n"
 				"You have access to these tools:\n"
 				"${tools_description}\n"
@@ -743,15 +1552,24 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"2) Delegate: Call the appropriate specialist based on router_agent's classification.\n"
 				"   CRITICAL for file/audio agents: When calling audio_agent or file_agent, you MUST pass the FULL query string (including the File_Name field). These agents need the file path information.\n"
 				"   Example: If query contains 'File_Name: /path/to/audio.wav', pass the entire query including that line to audio_agent.\n"
+				"   INFORMATION VERIFICATION (CRITICAL):\n"
+				"   - Information from specialist agents (especially web_agent) may be incomplete, outdated, or incorrect.\n"
+				"   - If the returned answer seems suspicious or doesn't match the question, consider:\n"
+				"     * Re-querying the specialist agent with more specific instructions\n"
+				"     * Trying an alternative approach or different agent\n"
+				"     * For web tasks: requesting web_agent to verify or re-extract the information\n"
+				"   - However, trust specialist agents' outputs by default unless there are clear inconsistencies.\n"
 				"3) Fallback Logic (CRITICAL):\n"
 				"   - If file_agent returns error/empty/unable_to_process (especially for counting/statistics tasks), automatically retry with math_agent.\n"
 				"   - If any agent fails but task involves counting/statistics/calculation, use math_agent as fallback.\n"
+				"   - If web_agent returns incomplete or unclear information, you may retry with more specific query or different extraction method.\n"
 				"4) Normalize (MANDATORY): After any specialist returns a candidate, ALWAYS call normalizer_agent with {question, candidate_answer}.\n"
 				"5) Finalize: Output ONLY the normalized answer.\n"
 				"RULES:\n"
 				"- ALWAYS check for missing information (especially time) BEFORE routing.\n"
 				"- When calling router_agent, pass the FULL query string (including any File_Name context and supplemented information).\n"
 				"- When calling audio_agent/file_agent, ALWAYS pass the FULL query string (including File_Name) so they can extract file paths.\n"
+				"- Be aware that information from web sources may not always be accurate - trust but verify when possible.\n"
 				"- Keep chain-of-thought internal; do not output reasoning.\n"
 				"- No prefixes (Answer:/Result:) or extra lines.\n"
 				"- The final output must be the normalized answer string only.\n"
@@ -834,13 +1652,29 @@ def compose_question(item: Dict[str, Any], input_jsonl_path: str) -> str:
         return q
 
     # 从 input_jsonl_path 提取 base_dir
-    base_dir = Path(input_jsonl_path).resolve().parent   # 取出 ./valid
+    try:
+        if not input_jsonl_path:
+            # 如果没有提供路径，使用默认的 valid 目录
+            base_dir = Path("./valid").resolve()
+        else:
+            base_dir = Path(input_jsonl_path).resolve().parent   # 取出 ./valid
+    except Exception as e:
+        logger.warning(f"Failed to resolve base_dir from {input_jsonl_path}: {e}, using default ./valid")
+        base_dir = Path("./valid").resolve()
 
     # 相对路径 -> 绝对路径
     def to_abs(p: str) -> str:
-        return str(base_dir / p.lstrip('./')) if not os.path.isabs(p) else p
+        if not p:
+            return ""
+        p = p.strip()
+        if os.path.isabs(p):
+            return p
+        # 处理相对路径
+        return str(base_dir / p.lstrip('./'))
 
-    q += f"\nFile_Name: {' '.join(to_abs(p) for p in paths)}"
+    abs_paths = [to_abs(p) for p in paths if p]
+    if abs_paths:
+        q += f"\nFile_Name: {' '.join(abs_paths)}"
     return q
 def load_jsonl_dataset(file_path):
     """Load dataset from JSONL file"""
@@ -978,7 +1812,8 @@ async def run_batch(
 				answer = ""
 				result_record = {}
 				try:
-					question = compose_question(item, input_jsonl_path)
+					# 使用处理后的 jsonl_file_path 而不是原始的 input_jsonl_path
+					question = compose_question(item, jsonl_file_path)
 					if not question:
 						logger.warning(f"Task {item.get('task_id', 'N/A')} has no question field, skipping.")
 						result_record = {"error": "no question field", **item.to_dict()}
