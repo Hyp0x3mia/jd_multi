@@ -376,6 +376,28 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 	)
 	oxy_space.append(audio_mcp)
 
+
+	# File MCP 工具（SenseVoice ASR）
+	file_mcp = oxy.StdioMCPClient(
+		name="file_content_tools",
+		params={
+			"command": "uv",
+			"args": ["--directory", "./mcp_servers", "run", "file/server.py"],
+		},
+	)
+	oxy_space.append(file_mcp)
+
+
+	# Dictionary MCP 工具
+	dictionary_mcp = oxy.StdioMCPClient(
+		name="dictionary_tools",
+		params={
+			"command": "uv",
+			"args": ["--directory", "./mcp_servers", "run", "dictionary/server.py"],
+		},
+	)
+	oxy_space.append(dictionary_mcp)
+
 	# 过滤掉可能为 None 的工具，避免后续 MAS 初始化时报 'NoneType' 错误
 	oxy_space = [t for t in oxy_space if t is not None]
 
@@ -483,7 +505,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 	# 移除 browser_agent，合并为 web_agent 单入口；保留视觉工具由 MCP 内部调用
 	
 	# FileAgent：文件处理
-	file_tools_list = ["file_tools"]
+	file_tools_list = ["file_content_tools"]
 	if "analyze_pdf_character_tool" in available_tools:
 		file_tools_list.append("analyze_pdf_character_tool")
 
@@ -501,6 +523,37 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- Detect file type first; extract only requested fields.\n"
 				"- If task asks to count files/list directory items, return the UNABLE_TO_PROCESS message above.\n"
 				"OUTPUT: Return only the minimal text/value(s) required by the question, OR the UNABLE_TO_PROCESS message if task is outside scope.\n"
+			),
+			timeout=120,
+		)
+	)
+
+
+
+	dictionary_tools_list = ["file_tools"]
+	if "dictionary_tools" in available_tools:
+		dictionary_tools_list.append("dictionary_tools")
+
+	oxy_space.append(
+		oxy.ReActAgent(
+			name="directory_agent",
+			desc="Directory Operations Specialist – handle file/directory creation, reading, writing, deletion, info query, counting, and listing.",
+			tools=dictionary_tools_list,
+			llm_model="zai-org/GLM-4.5",
+			additional_prompt=(
+           "ROLE: File Operations Specialist\n"
+            "SCOPE: Perform file/directory operations including: create/write/overwrite, read content, delete, get details, count specific file types, and list directory contents.\n"
+            "LIMITATIONS:\n"
+            "- Only operates within allowed directories; cannot access restricted paths.\n"
+            "- Overwriting/deleting files is irreversible – confirm path accuracy before using write_file/delete_file.\n"
+            "POLICY:\n"
+            "1. For content extraction: Use read_file first; if parsing PDFs, ensure tool is available (if added).\n"
+            "2. For writing: Use write_file with explicit path and content; warn implicitly (via tool's nature) about overwrites.\n"
+            "3. For deletion: Verify path exists with get_file_info before calling delete_file to avoid errors.\n"
+            "4. For counting: Use count_files with path, optional file_type (e.g., '.txt'), and recursive flag as needed.\n"
+            "5. For listing: Use list_directory with filters (file_type) and recursion as requested.\n"
+            "6. For file details (size, modified time, etc.): Use get_file_info.\n"
+            "OUTPUT: Return tool results directly, or error messages if operations fail. Be concise but include critical details (e.g., 'Deleted: /path' or 'Count: 5 .txt files').\n"
 			),
 			timeout=120,
 		)
@@ -635,6 +688,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- 'web': Web search, browser automation, and extraction (github, youtube, wikipedia, 链接, 网页, 仓库, 搜索, 查找, 浏览器, 自动化, 点击, 填写, 表单)\n"
 				"- 'audio': Audio transcription (音频/语音/录音/asr/转写: wav/mp3/m4a/flac). File_Name must be an audio file.\n"
 				"- 'file': File content extraction/analysis (read pdf, extract text from images, analyze document content).\n"
+				"- 'directory': Directory Operations  – handle file/directory creation, reading, writing, deletion, info query, counting, and listing.\n"
 				"  * NOT for counting files or listing directories - that's 'math'.\n"
 				"  * Use 'file' when task asks to extract/read content FROM a file (not count files).\n"
 				"\n"
@@ -663,7 +717,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			name="master_agent",
 			sub_agents=[
 				"router_agent", "math_agent", "time_agent", 
-				"web_agent", "audio_agent", "file_agent", "normalizer_agent"
+				"web_agent", "audio_agent", "file_agent","directory_agent", "normalizer_agent"
 			],
 			llm_model="zai-org/GLM-4.6",
 			additional_prompt=(
@@ -721,32 +775,73 @@ async def run_single(question: str, enable_mcp: bool = False) -> str:
 		return _normalize_answer(cleaned_answer)
 
 
-def compose_question(item: Dict[str, Any]) -> str:
-	"""组合问题，处理 file_name 字段"""
-	q = item.get("query") or item.get("question") or item.get("input") or ""
-	file_name = item.get("file_name")
-	if file_name:
-		# Handle file_name: can be a string, list of strings, or list with single item
-		if isinstance(file_name, list):
-			# Extract actual file paths from list (filter out empty strings)
-			paths = [str(f).strip() for f in file_name if f and str(f).strip()]
-			if paths:
-				# Join multiple paths with space for clarity
-				file_paths_str = " ".join(paths)
-				q += f"\nFile_Name: {file_paths_str}"
-		else:
-			# file_name is a string - use as-is if it's already a full path
-			file_name_str = str(file_name).strip()
-			if file_name_str:
-				# If it's a relative path starting with './' or just filename, construct full path
-				if file_name_str.startswith('./') or (not os.path.isabs(file_name_str) and '/' not in file_name_str):
-					# Construct path relative to valid dataset directory
-					base_dir = Path("./valid")
-					if base_dir.exists():
-						file_name_str = str(base_dir / file_name_str.lstrip('./'))
-				q += f"\nFile_Name: {file_name_str}"
-	return q
+# def compose_question(item: Dict[str, Any]) -> str:
+# 	"""组合问题，处理 file_name 字段"""
+# 	q = item.get("query") or item.get("question") or item.get("input") or ""
+# 	file_name = item.get("file_name")
+# 	if file_name:
+# 		# Handle file_name: can be a string, list of strings, or list with single item
+# 		if isinstance(file_name, list):
+# 			# Extract actual file paths from list (filter out empty strings)
+# 			paths = [str(f).strip() for f in file_name if f and str(f).strip()]
+# 			if paths:
+# 				# Join multiple paths with space for clarity
+# 				file_paths_str = " ".join(paths)
+# 				q += f"\nFile_Name: {file_paths_str}"
+# 		else:
+# 			# file_name is a string - use as-is if it's already a full path
+# 			file_name_str = str(file_name).strip()
+# 			if file_name_str:
+# 				# If it's a relative path starting with './' or just filename, construct full path件夹最后有/
+# 				if file_name_str.startswith('./') or (not os.path.isabs(file_name_str) ):
+# 					# Construct path relative to valid dataset directory
+# 					base_dir = Path("./valid")
+# 					if base_dir.exists():
+# 						file_name_str = str(base_dir / file_name_str.lstrip('./'))
+# 				q += f"\nFile_Name: {file_name_str}"
+# 	return q
+from typing import Any, Dict, List, Union
 
+def _parse_maybe_list(file_name: Union[str, List[str], None]) -> List[str]:
+    """统一把 file_name 转成 List[str]，兼容字符串/类 list 字符串/真正 list。"""
+    if file_name is None:
+        return []
+    if isinstance(file_name, list):
+        return [str(f).strip() for f in file_name if f and str(f).strip()]
+
+    s = str(file_name).strip()
+    if not s:
+        return []
+    # 尝试解析 "['a','b']"
+    if (s.startswith('[') and s.endswith(']')) or (s.startswith('(') and s.endswith(')')):
+        try:
+            return [str(i) for i in json.loads(s.replace("'", '"'))]
+        except Exception:
+            pass
+    return [s]
+
+
+def compose_question(item: Dict[str, Any], input_jsonl_path: str) -> str:
+    """
+    组合问题
+    :param item: 原始数据行
+    :param input_jsonl_path: 形如 "./valid/data2.jsonl" 的字符串，用来提取 base_dir（valid）
+    """
+    q = item.get("query") or item.get("question") or item.get("input") or ""
+
+    paths = _parse_maybe_list(item.get("file_name"))
+    if not paths:
+        return q
+
+    # 从 input_jsonl_path 提取 base_dir
+    base_dir = Path(input_jsonl_path).resolve().parent   # 取出 ./valid
+
+    # 相对路径 -> 绝对路径
+    def to_abs(p: str) -> str:
+        return str(base_dir / p.lstrip('./')) if not os.path.isabs(p) else p
+
+    q += f"\nFile_Name: {' '.join(to_abs(p) for p in paths)}"
+    return q
 def load_jsonl_dataset(file_path):
     """Load dataset from JSONL file"""
     datasets = []
@@ -883,7 +978,7 @@ async def run_batch(
 				answer = ""
 				result_record = {}
 				try:
-					question = compose_question(item)
+					question = compose_question(item, input_jsonl_path)
 					if not question:
 						logger.warning(f"Task {item.get('task_id', 'N/A')} has no question field, skipping.")
 						result_record = {"error": "no question field", **item.to_dict()}
