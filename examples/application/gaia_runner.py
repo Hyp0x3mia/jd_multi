@@ -79,16 +79,46 @@ def _clean_final_answer(text: str) -> str:
 			text = text[:-len(suffix)].strip()
 			break
 	
-	# 如果包含多行，只取第一行（通常是最终答案）
+	# 如果包含多行，需要智能提取最终答案
 	if '\n' in text:
-		lines = text.split('\n')
-		# 找到包含实际答案的行
-		for line in lines:
-			line = line.strip()
-			if line and not any(keyword in line.lower() for keyword in 
-				['explanation', 'explain', 'reasoning', 'because', '由于', '因为', '解释', '说明']):
-				text = line
-				break
+		lines = [line.strip() for line in text.split('\n') if line.strip()]
+		
+		if lines:
+			# 策略1：优先选择最后一行（通常 normalizer_agent 会把最终答案放在最后）
+			last_line = lines[-1]
+			
+			# 检查最后一行是否看起来完整（不以冒号、逗号等结尾，表示可能是完整的答案）
+			incomplete_markers = ['：', ':', '，', ',', '。', '.', '；', ';']
+			is_incomplete = any(last_line.rstrip().endswith(marker) for marker in incomplete_markers)
+			
+			# 检查是否包含解释性关键词
+			has_explanation_keywords = any(keyword in last_line.lower() for keyword in 
+				['explanation', 'explain', 'reasoning', 'because', '由于', '因为', '解释', '说明', 'according', '根据'])
+			
+			# 如果最后一行不完整或包含解释性关键词，从后往前找完整的答案行
+			if is_incomplete or (has_explanation_keywords and len(last_line) > 100):
+				# 从后往前找第一个看起来像完整答案的行
+				for line in reversed(lines):
+					line_stripped = line.strip()
+					if not line_stripped:
+						continue
+					
+					# 跳过包含解释性关键词的长行
+					has_expl = any(keyword in line_stripped.lower() for keyword in 
+						['explanation', 'explain', 'reasoning', 'because', '由于', '因为', '解释', '说明', 'according', '根据'])
+					line_incomplete = any(line_stripped.rstrip().endswith(marker) for marker in incomplete_markers)
+					
+					# 如果这一行没有解释性关键词且看起来完整，使用它
+					if not has_expl and not line_incomplete:
+						text = line_stripped
+						break
+					# 如果这一行有解释性关键词但很短（可能是简洁答案），也使用它
+					elif has_expl and len(line_stripped) < 50:
+						text = line_stripped
+						break
+			else:
+				# 最后一行看起来完整且没有明显的问题，使用它
+				text = last_line
 	
 	return text
 
@@ -113,13 +143,30 @@ def _normalize_answer(text: str) -> str:
 	except ValueError:
 		pass
 
-	# 逗号分割处理
+	# 逗号分割处理（按规则去空格）
 	if ',' in text:
 		parts = [p.strip() for p in text.split(',')]
-		# 去重并排序
-		unique_parts = list(dict.fromkeys(parts))  # 保持顺序去重
-		return ', '.join(unique_parts)
+		# 去重，保持顺序
+		unique_parts = list(dict.fromkeys(parts))
+		# 若题目常要求“仅用英文逗号间隔”，默认不加空格
+		return ','.join(unique_parts)
 
+	# 规则化去空格：
+	# 1) 纯数字/数字小数/带符号数字：去掉所有空格
+	compact = text.replace(' ', '')
+	try:
+		_ = float(compact)
+		return compact
+	except ValueError:
+		pass
+
+	# 2) 仅由中英文字母/数字/中文/连字符/下划线/点号构成的短答案：去掉所有空格
+	import re
+	if re.fullmatch(r"[\w\u4e00-\u9fa5\-\.]+( [\w\u4e00-\u9fa5\-\.]+)*", text):
+		return text.replace(' ', '')
+
+	# 3) 其他场景：折叠多余空格为单个，并去首尾空格
+	text = re.sub(r"\s+", " ", text).strip()
 	return text
 
 
@@ -394,6 +441,32 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"POLICY:\n"
 				"- Keep steps minimal: search → open → extract.\n"
 				"- Prefer primary sources and exact matches.\n"
+				"CRITICAL FOR GITHUB ISSUES:\n"
+				"- When searching GitHub issues (e.g., 'issue #12345', 'GitHub issue'), GitHub by default shows only OPEN issues.\n"
+				"- If the query asks about an issue (especially with a number like '#40054') and you cannot find it, it may be CLOSED.\n"
+				"- PREFERRED METHOD: Use GitHub's search box with filter syntax (RECOMMENDED - avoids clicking multiple buttons).\n"
+				"- GitHub Issues search supports filter syntax in the search box:\n"
+				"  * 'is:all #40054' - Search all issues (open and closed) with number 40054\n"
+				"  * 'is:issue is:closed #40054' - Search closed issues with number 40054\n"
+				"  * 'state:all #40054' - Alternative syntax for all states\n"
+				"  * 'is:open #40054' - Explicitly search open issues (default)\n"
+				"- Steps for GitHub issue pages (USE SEARCH BOX METHOD):\n"
+				"  1) Navigate to the repository's issues page (e.g., https://github.com/huggingface/transformers/issues)\n"
+				"  2) Locate the search box at the top of the issues page (usually has placeholder like 'Search all issues' or 'Filter issues')\n"
+				"  3) Type filter syntax directly into the search box:\n"
+				"     - For any issue (open or closed): 'is:all #40054' or 'state:all #40054'\n"
+				"     - For specific closed issue: 'is:closed #40054' or 'is:issue is:closed #40054'\n"
+				"  4) Press Enter or click search to filter\n"
+				"  5) If issue found, click on it to open the issue page\n"
+				"  6) Extract the required information from the issue page\n"
+				"- ALTERNATIVE METHOD (if search box doesn't work):\n"
+				"  - If the search box filter syntax doesn't work, you may need to click filter buttons:\n"
+				"    1) Navigate to issues page\n"
+				"    2) Look for filter buttons/tabs (Open/Closed/All) near the top\n"
+				"    3) Click on 'All' to show all issues\n"
+				"    4) Use the search box to find the specific issue number\n"
+				"- Example: Query 'GitHub issue #40054' → Navigate to issues page → Type 'is:all #40054' in search box → Press Enter → Click on the issue → Extract info.\n"
+				"- IMPORTANT: Always try the search box filter syntax FIRST before clicking buttons, as it's faster and more reliable.\n"
 				"OUTPUT FORMAT RULES (CRITICAL):\n"
 				"- If question explicitly requests a specific format (e.g., 'comma-separated', '仅用英文逗号间隔', '以逗号分隔'), output ONLY in that exact format.\n"
 				"- If question asks for a list (e.g., 'six items', '六个板块'), and requests comma separation, output: 'item1,item2,item3,...' (NO descriptions, NO explanations).\n"
@@ -596,7 +669,23 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			additional_prompt=(
 				"ROLE: Master Coordinator\n"
 				"WORKFLOW:\n"
-				"1) Route: Call router_agent with the COMPLETE query (including File_Name if present). Router needs full context to classify correctly.\n"
+				"0) Information Gap Analysis (CRITICAL - DO THIS FIRST):\n"
+				"   - Before routing, analyze the query for missing information that requires tool calls.\n"
+				"   - If query involves time/date but doesn't specify current time:\n"
+				"     * Call time_agent with a query like 'get current time' or '当前时间是什么' to obtain current date/time.\n"
+				"     * time_agent will use get_current_time tool and return the current time.\n"
+				"     * Append the current time information to the original query before routing.\n"
+				"     * Example: Original query '3天前是什么日期' → Call time_agent → Get 'Current time: 2025-11-03' → Append to query: '3天前是什么日期。当前时间: 2025-11-03' → Then route to time_agent.\n"
+				"   - If query involves other dynamic information (e.g., current weather, stock prices, real-time data):\n"
+				"     * Use appropriate agents/tools to fetch the missing information first.\n"
+				"     * Supplement the query with this information before routing.\n"
+				"   - Common scenarios requiring information supplementation:\n"
+				"     * Time-relative queries ('3天前', 'last week', '下个月', 'yesterday', '前天', '明天')\n"
+				"     * Date calculations without reference point ('今天是星期几', '这个月有多少天')\n"
+				"     * '当前'/'current'/'now'/'现在' keywords in time context\n"
+				"   - After supplementing information, continue to step 1.\n"
+				"   - IMPORTANT: If the query already contains explicit date/time (e.g., '2025-11-03', 'October 15'), you may skip this step.\n"
+				"1) Route: Call router_agent with the COMPLETE query (including File_Name if present, and any supplemented information). Router needs full context to classify correctly.\n"
 				"2) Delegate: Call the appropriate specialist based on router_agent's classification.\n"
 				"   CRITICAL for file/audio agents: When calling audio_agent or file_agent, you MUST pass the FULL query string (including the File_Name field). These agents need the file path information.\n"
 				"   Example: If query contains 'File_Name: /path/to/audio.wav', pass the entire query including that line to audio_agent.\n"
@@ -606,7 +695,8 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"4) Normalize (MANDATORY): After any specialist returns a candidate, ALWAYS call normalizer_agent with {question, candidate_answer}.\n"
 				"5) Finalize: Output ONLY the normalized answer.\n"
 				"RULES:\n"
-				"- When calling router_agent, pass the FULL query string (including any File_Name context).\n"
+				"- ALWAYS check for missing information (especially time) BEFORE routing.\n"
+				"- When calling router_agent, pass the FULL query string (including any File_Name context and supplemented information).\n"
 				"- When calling audio_agent/file_agent, ALWAYS pass the FULL query string (including File_Name) so they can extract file paths.\n"
 				"- Keep chain-of-thought internal; do not output reasoning.\n"
 				"- No prefixes (Answer:/Result:) or extra lines.\n"
@@ -783,7 +873,8 @@ async def run_batch(
 	total_count = 0
 
 	# 打开 JSONL 文件用于追加写入（每条任务完成后立即保存）
-	jsonl_file = open(output_jsonl_path, "w", encoding="utf-8")
+	# 使用 "a" 模式以支持从中断处继续运行
+	jsonl_file = open(output_jsonl_path, "a", encoding="utf-8")
 	
 	try:
 		oxy_space = build_oxy_space(enable_mcp=enable_mcp)
@@ -805,6 +896,10 @@ async def run_batch(
 					logger.info(f"Processing task {item.get('task_id', 'N/A')}: {question[:50]}...")
 					resp = await mas.call(callee="master_agent", arguments={"query": question})
 					answer = resp.output if hasattr(resp, "output") else str(resp)
+					
+					# 清理答案：移除前导/尾随空白字符，并应用标准化清理
+					cleaned_answer = _clean_final_answer(answer)
+					answer = _normalize_answer(cleaned_answer)
 					
 					# 保存结果到 checkpoint 和 Parquet
 					save_result(item, answer, result_dir, checkpoint_file, failed_checkpoint_file, is_error=False)
