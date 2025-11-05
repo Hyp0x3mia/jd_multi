@@ -1130,6 +1130,32 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 	)
 	oxy_space.append(audio_mcp)
 
+	# 注册 Case Bank MCP
+	try:
+		case_bank_mcp = oxy.StdioMCPClient(
+			name="mcp-case-bank",
+			params={
+				"command": "uv",
+				"args": ["--directory", "./mcp_servers/mcp-case-bank", "run", "server.py"],
+			},
+		)
+		oxy_space.append(case_bank_mcp)
+	except Exception as e:
+		print(f"Warning: Could not add mcp-case-bank: {e}")
+
+	# 注册 To-Do MCP
+	try:
+		todo_mcp = oxy.StdioMCPClient(
+			name="mcp-todo",
+			params={
+				"command": "uv",
+				"args": ["--directory", "./mcp_servers/mcp-todo", "run", "server.py"],
+			},
+		)
+		oxy_space.append(todo_mcp)
+	except Exception as e:
+		print(f"Warning: Could not add mcp-todo: {e}")
+
 	# 注册新版 GitHub 稳定 API 工具与 Guardrails/Sanity（供 web_agent 优先使用）
 	oxy_space.append(github_api_tools)
 	oxy_space.append(github_guardrails)
@@ -1269,6 +1295,24 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"   - When using browser_navigate, prefer wait_until='domcontentloaded' to reduce waiting time.\n"
 				"   - Use full-page screenshots when the target may appear outside the initial viewport; otherwise prefer minimal screenshots.\n"
 				"4) If visual content required (text in image, buttons, tables), call browser_analyze_screenshot with a precise, minimal prompt.\n"
+				"HIT_POLICY (CRITICAL - HARD STOP):\n"
+				"- Once any API/URL/page content yields sufficient, directly usable evidence (exact number/date/name/link/table row), you MUST STOP all further search/navigation.\n"
+				"- After HIT: Only one optional local extraction (on current result/page) is allowed; then finalize.\n"
+				"- Prohibited after HIT: search_github_issues, search_baidu, browser_navigate to a new site, or any external search.\n"
+				"IDEMPOTENCE / DEDUP (STRICT):\n"
+				"- Within a single task, you may call each search tool at most once per normalized query signature.\n"
+				"- Do NOT repeat identical or trivially similar queries (case-insensitive, trimmed, stop-words removed).\n"
+				"- If a search returned results already analyzed, do not call search again — switch to analysis or extraction.\n"
+				"BUDGET (LIMITS):\n"
+				"- search_* tools: budget = 1 per task unless first returned empty; one retry allowed only if you REDUCE keywords.\n"
+				"- If API hit (Github.SearchIssues/GetIssue) already provides the needed value, browser budget = 0 (skip browser).\n"
+				"VISUAL-FIRST HEURISTICS (IMAGE/TEXT-IN-IMAGE CASES):\n"
+				"- If the query mentions or implies values often embedded in images (e.g., 证书/收藏证书/编号/第…号/海报/公告/票据/榜单/截图/照片), prioritize on-page visual extraction over external search.\n"
+				"  1) Navigate/open the candidate page (if already on page, skip search).\n"
+				"  2) Take a screenshot (full_page=true when content may be below the fold).\n"
+				"  3) Call browser_analyze_screenshot with a precise prompt to OCR the target field only.\n"
+				"  4) Use regex-like extraction guidance in the prompt, e.g., 提取“总第…号/第…号/证书编号/No.”等字样后的编号，输出数字或编号本体。\n"
+				"- After a successful visual hit, STOP all searches and finalize.\n"
 				"POLICY:\n"
 				"- Keep steps minimal: search → analyze results → extract → STOP.\n"
 				"- Prefer primary sources and exact matches.\n"
@@ -1610,6 +1654,14 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"router_agent", "math_agent", "time_agent", 
 				"web_agent", "audio_agent", "file_agent","directory_agent", "normalizer_agent"
 			],
+			tools=[
+				# guard & utils
+				"python_tools", "final_answer_guard",
+				# case bank tools
+				"casebank_ping", "case_save", "case_search", "case_update_score", "case_get",
+				# todo tools
+				"todo_ping", "todo_create", "todo_list", "todo_update", "todo_autogen_from_case", "todo_link_case", "todo_stats"
+			],
 			llm_model="zai-org/GLM-4.6",
 			additional_prompt=(
 				"ROLE: Master Coordinator\n"
@@ -1630,7 +1682,10 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"     * '当前'/'current'/'now'/'现在' keywords in time context\n"
 				"   - After supplementing information, continue to step 1.\n"
 				"   - IMPORTANT: If the query already contains explicit date/time (e.g., '2025-11-03', 'October 15'), you may skip this step.\n"
-				"1) Route: Call router_agent with the COMPLETE query (including File_Name if present, and any supplemented information). Router needs full context to classify correctly.\n"
+				"1) Case Lookup (BEFORE planning): Call case_search with {query, signature?}. If items found and score≥SIM_THRESHOLD, load the first item's plan as plan_template (do NOT change the final goal).\n"
+				"   - signature may include {task_type, answer_type, level}.\n"
+				"   - Keep evidence in logs (case_id, score).\n"
+				"2) Route: Call router_agent with the COMPLETE query (including File_Name if present, and any supplemented information). Router needs full context to classify correctly.\n"
 				"2) Delegate: Call the appropriate specialist based on router_agent's classification.\n"
 				"   CRITICAL for file/audio agents: When calling audio_agent or file_agent, you MUST pass the FULL query string (including the File_Name field). These agents need the file path information.\n"
 				"   Example: If query contains 'File_Name: /path/to/audio.wav', pass the entire query including that line to audio_agent.\n"
@@ -1646,7 +1701,9 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"   - If any agent fails but task involves counting/statistics/calculation, use math_agent as fallback.\n"
 				"   - If web_agent returns incomplete or unclear information, you may retry with more specific query or different extraction method.\n"
 				"4) Normalize (MANDATORY): After any specialist returns a candidate, ALWAYS call normalizer_agent with {question, candidate_answer}.\n"
-				"5) Finalize: Output ONLY the normalized answer.\n"
+				"5) Commit Final Answer (GUARD): After normalization, call final_answer_guard('commit', answer, answer_type). If commit succeeds, proceed.\n"
+				"6) Persist Case (AFTER success): If guard commit succeeded, call case_save(...) then case_update_score(success:true, latency_ms?).\n"
+				"7) On Failure/Timeout: call case_update_score(success:false) and todo_autogen_from_case({case_id, reason, attach}).\n"
 				"RULES:\n"
 				"- ALWAYS check for missing information (especially time) BEFORE routing.\n"
 				"- When calling router_agent, pass the FULL query string (including any File_Name context and supplemented information).\n"
@@ -1737,12 +1794,12 @@ def compose_question(item: Dict[str, Any], input_jsonl_path: str) -> str:
     try:
         if not input_jsonl_path:
             # 如果没有提供路径，使用默认的 valid 目录
-            base_dir = Path("./valid").resolve()
+            base_dir = Path("./test").resolve()
         else:
             base_dir = Path(input_jsonl_path).resolve().parent   # 取出 ./valid
     except Exception as e:
-        logger.warning(f"Failed to resolve base_dir from {input_jsonl_path}: {e}, using default ./valid")
-        base_dir = Path("./valid").resolve()
+        logger.warning(f"Failed to resolve base_dir from {input_jsonl_path}: {e}, using default ./test")
+        base_dir = Path("./test").resolve()
 
     # 相对路径 -> 绝对路径
     def to_abs(p: str) -> str:
@@ -1855,7 +1912,7 @@ async def run_batch(
 	logger.info(f"Loaded {len(processed)} already processed tasks from checkpoint.")
 
 	# 加载数据集 - 使用 input_jsonl_path 参数
-	jsonl_file_path = input_jsonl_path if input_jsonl_path else "./valid/data.jsonl"
+	jsonl_file_path = input_jsonl_path if input_jsonl_path else "./test/data.jsonl"
 	if not Path(jsonl_file_path).exists():
 		logger.error(f"Dataset file not found: {jsonl_file_path}")
 		return
