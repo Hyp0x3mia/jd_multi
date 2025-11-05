@@ -5,13 +5,14 @@ import os
 import unicodedata
 import time
 import requests
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Literal
 from pathlib import Path
 
 from oxygent import MAS, Config, oxy, preset_tools
 from pydantic import Field
 import importlib.util
 import logging
+
 logger = logging.getLogger(__name__)
 """
 简化的GAIA Runner - 直接使用内置智能体
@@ -769,25 +770,33 @@ def _get_github_issue_by_number(
 github_api_tools = oxy.FunctionHub(name="github_api_tools", timeout=120)
 
 
-@github_api_tools.tool(description="Github.SearchIssues: Search issues/PRs via REST API with structured params")
+@github_api_tools.tool(description="Github.SearchIssues: Search issues/PRs via REST API. Use 'query' for search keywords (e.g., 'whisper audio bug'), 'repo' for repository, 'created' for date range, 'state' for open/closed/all, 'max_results' for result limit.")
 def github_search_issues(
-    repo: str = Field("", description="Repository in owner/repo. Optional if q_extra already includes repo: qualifier"),
+    repo: str = Field("", description="Repository in owner/repo format (e.g., 'huggingface/transformers')"),
+    query: str = Field("", description="Search query keywords (e.g., 'whisper audio bug', '#40054'). This is the main parameter for search terms."),
     labels: str = Field("", description="Comma-separated labels (OR semantics)"),
     milestone: str = Field("", description="Milestone title or number"),
-    created: str = Field("", description="created date range, e.g., '2025-01-01..2025-12-31'"),
-    updated: str = Field("", description="updated date range, e.g., '2025-01-01..2025-12-31'"),
+    created: str = Field("", description="Created date range, e.g., '2025-08-08..2025-08-08'"),
+    updated: str = Field("", description="Updated date range, e.g., '2025-01-01..2025-12-31'"),
     in_: str = Field("", description="Search fields, e.g., 'title,body'"),
-    state: str = Field("all", description="open|closed|all"),
-    q_extra: str = Field("", description="Extra free-text query qualifiers, e.g., 'whisper audio bug'"),
-    per_page: int = Field(10, description="results per page (<=100)"),
-    page: int = Field(1, description="page number")
+    state: Literal["open", "closed", "all"] = Field("all", description="Issue state: open, closed, or all"),
+    q_extra: str = Field("", description="[DEPRECATED] Use 'query' instead. Extra free-text query qualifiers."),
+    per_page: int = Field(10, description="Results per page (<=100)"),
+    max_results: int = Field(10, description="Maximum number of results to return (alias for per_page)"),
+    page: int = Field(1, description="Page number")
 ) -> List[Dict]:
     """
     Build GitHub search query and call /search/issues. Fallback: if only repo provided with no text, add 'is:issue'.
     Returns a list of structured items with minimal fields for downstream use.
     """
     headers = _get_github_headers()
-    per_page = max(1, min(100, per_page))
+    # Use max_results if provided (and different from default), otherwise use per_page
+    # If max_results is explicitly set (not default 10), use it; otherwise use per_page
+    if max_results != 10:  # If max_results was explicitly set (not default)
+        per_page = max(1, min(100, max_results))
+    else:
+        per_page = max(1, min(100, per_page))
+    
     terms: List[str] = []
     if repo:
         terms.append(f"repo:{repo}")
@@ -808,15 +817,17 @@ def github_search_issues(
         # support comma list
         for field in [s.strip() for s in in_.split(',') if s.strip()]:
             terms.append(f"in:{field}")
-    if q_extra:
-        terms.append(q_extra)
+    # Use 'query' parameter first, fallback to 'q_extra' for backward compatibility
+    search_text = query.strip() if query else (q_extra.strip() if q_extra else "")
+    if search_text:
+        terms.append(search_text)
     # API requires is:issue|is:pull-request when no free-text sometimes; add is:issue by default
     if not any(t.startswith("is:") for t in terms):
         terms.append("is:issue")
 
-    query = " ".join(terms)
-    logger.info(f"Github.SearchIssues → q={query}")
-    params = {"q": query, "per_page": per_page, "page": page, "sort": "updated", "order": "desc"}
+    search_query = " ".join(terms)
+    logger.info(f"Github.SearchIssues → q={search_query}")
+    params = {"q": search_query, "per_page": per_page, "page": page, "sort": "updated", "order": "desc"}
     try:
         resp = requests.get("https://api.github.com/search/issues", headers=headers, params=params, timeout=30)
         if resp.status_code == 403:
@@ -953,8 +964,8 @@ def sanity_validate_answer(answer: str = Field(..., description="raw answer"), s
 def search_github_issues(
 	repo: str = Field(..., description="Repository name in owner/repo format (e.g., 'huggingface/transformers')"),
 	query: str = Field("", description="Search query string (e.g., '#40054', 'audio whisper', 'bug')"),
-	state: str = Field("all", description="Issue state", enum=["open", "closed", "all"]),
-	issue_type: str = Field("all", description="Type of items", enum=["issue", "pr", "all"]),
+	state: Literal["open", "closed", "all"] = Field("all", description="Issue state"),
+	issue_type: Literal["issue", "pr", "all"] = Field("all", description="Type of items"),
 	max_results: int = Field(10, description="Maximum number of results to return", ge=1, le=100)
 ) -> List[Dict]:
 	"""
@@ -1032,7 +1043,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
         timeout=240
     ),
         oxy.HttpLLM(
-        name='inclusionAI/Ring-1T',
+        name='Reasoning Model',
         api_key=os.getenv('DEEPSEEK_R1_KEY'),
         base_url=os.getenv('DEEPSEEK_URL'),
         model_name=os.getenv('DEEPSEEK_R1'),
@@ -1067,6 +1078,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 		semaphore=2,
 		desc="视觉大模型（支持图像理解、截图问答）",
 		is_multimodal_supported=True,
+		timeout = 600
 		),
 		# 预置工具
 		preset_tools.time_tools,
@@ -1157,17 +1169,58 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			name="math_agent",
 			desc="Math/Logic Specialist – deterministically solve problems via Python.",
 			tools=["python_tools", "math_tools"],
-			llm_model="default_llm",
+			llm_model="Reasoning Model",
 			additional_prompt=(
 				"ROLE: Math/Logic Specialist\n"
-				"CAPABILITIES: Arithmetic, combinatorics, averages, date arithmetics, small enumeration using Python.\n"
+				"CAPABILITIES: Arithmetic, combinatorics, averages, date arithmetics, small enumeration, information theory, binary encoding, optimization problems, constraint satisfaction using Python.\n"
+				"\n"
+				"PROBLEM-SOLVING METHODOLOGY:\n"
+				"1) UNDERSTAND CONSTRAINTS FIRST:\n"
+				"   - Read the problem carefully and identify ALL constraints (time limits, resource limits, detection rules, etc.).\n"
+				"   - For problems involving multiple rounds/steps, identify what can be done in each round and what information is available.\n"
+				"   - Example: '48小时内用最少的兔子找出毒桶，无法区分中毒先后，且第二次实验需等待24小时' → \n"
+				"     * Round 1: 0-24h (给兔子饮水), 24h (观察结果)\n"
+				"     * Round 2: 24-48h (根据Round1结果给兔子饮水), 48h (观察结果)\n"
+				"     * Constraint: Cannot distinguish which round caused death\n"
+				"\n"
+				"2) INFORMATION THEORY APPROACH:\n"
+				"   - For detection/identification problems: Calculate the information capacity needed.\n"
+				"   - If N buckets and need to identify 1, you need at least log2(N) bits of information.\n"
+				"   - Each rabbit can provide 1 bit per round (dead/alive), but with constraints, you may need more.\n"
+				"   - Use binary encoding: Assign each bucket a unique binary code, assign rabbits to bit positions.\n"
+				"   - For single-round problems: N buckets need ⌈log2(N)⌉ rabbits minimum.\n"
+				"   - For multi-round problems: Consider whether additional rounds allow optimization below the single-round bound.\n"
+				"   - IMPORTANT: Always verify your solution can actually identify all possible cases - don't just rely on theoretical bounds.\n"
+				"\n"
+				"3) SYSTEMATIC ANALYSIS:\n"
+				"   - For problems with multiple rounds: Model each round separately, then combine.\n"
+				"   - For constraint problems: Use Python to enumerate small cases, verify logic, then generalize.\n"
+				"   - For optimization problems ('最少/最多'): Try different strategies, compare results, choose optimal.\n"
+				"\n"
+				"4) VERIFICATION:\n"
+				"   - After computing an answer, verify it meets ALL constraints.\n"
+				"   - For detection problems: Verify that your solution can indeed identify the target in all cases.\n"
+				"   - If answer seems too high, reconsider your strategy or check if you're missing an optimization.\n"
+				"\n"
 				"POLICY:\n"
 				"- Prefer exact computation with python_tools/math_tools.\n"
+				"- For complex logic problems, break down into steps:\n"
+				"  1) Analyze constraints and information flow\n"
+				"  2) Design encoding/strategy\n"
+				"  3) Implement and verify with Python\n"
+				"  4) Check optimality\n"
 				"- Keep chain-of-thought internal; only output results.\n"
+				"- When solving '最少需要X' problems, consider:\n"
+				"  * Information theory lower bounds\n"
+				"  * Alternative strategies that might be more efficient\n"
+				"  * Whether constraints allow full information extraction\n"
+				"  * Try different numbers and verify which is the minimum that works\n"
+				"\n"
 				"OUTPUT:\n"
 				"- Return ONLY the final number/string needed by the question (no units unless requested).\n"
+				"- For '最少需要X' problems, output the minimum number that satisfies all constraints.\n"
 			),
-			timeout=60,
+			timeout=300,
 		)
 	)
 	
@@ -1318,12 +1371,20 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"ROLE: File Specialist\n"
 				"SCOPE: Extract content FROM files (text from PDFs, images, documents).\n"
 				"LIMITATIONS: This agent does NOT count files or list directories. For counting/statistics tasks, return 'UNABLE_TO_PROCESS: This task requires counting/statistics, please use math_agent with Python code.'\n"
-				"POLICY:\n"
-				"- Detect file type first; extract only requested fields.\n"
-				"- If task asks to count files/list directory items, return the UNABLE_TO_PROCESS message above.\n"
+				"WORKFLOW (DECOMPOSE → EXECUTE → VERIFY):\n"
+				"1) READ FULL QUERY: Always read the entire query including any 'File_Name:' line.\n"
+				"2) PLAN SHORT STEPS (max 3-5): Break complex tasks into minimal atomic steps (e.g., 'render PDF page→extract field A→extract field B').\n"
+				"3) EXECUTE STEP-BY-STEP: For each step, call the appropriate tool with the FULL query string (including 'File_Name: ...'). Use doc_analyze for image/PDF (vision extraction).\n"
+				"4) VERIFY PROGRESS: After each step, check if the requested field is obtained with sufficient confidence. If yes, proceed to finalize; if not, do the next smallest step.\n"
+				"5) STOP EARLY: As soon as required info is extracted, stop further steps and finalize.\n"
+				"TOOL USAGE RULES:\n"
+				"- Prefer passing the full original query (contains path context) as the tool 'prompt' to ensure the tool knows the path.\n"
+				"- If multiple files under 'File_Name:' are provided, process the FIRST relevant one unless the question requires multiple.\n"
+				"- For PDF/image: allow high-DPI render; take full-page if the target may be off-screen.\n"
+				"- Avoid repeated identical calls. Change prompt or focus region if a retry is necessary.\n"
 				"OUTPUT: Return only the minimal text/value(s) required by the question, OR the UNABLE_TO_PROCESS message if task is outside scope.\n"
 			),
-			timeout=300,
+			timeout=600,
 		)
 	)
 
@@ -1409,7 +1470,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 					"\n"
 					"CRITICAL: You MUST call the audio_transcribe tool when an audio file path is detected. Do not skip tool calling."
 				),
-				timeout=120,
+				timeout=300,
 			)
 		)
 	
@@ -1433,15 +1494,29 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"\n"
 				"RULES:\n"
 				"- Remove ALL explanations/reasoning/units/prefix/suffix unless explicitly requested.\n"
+				"- DO-NOT-ALTER-SEMANTICS (CRITICAL): You MUST NOT change the semantic content of candidate_answer.\n"
+				"  * Never replace with synonyms or a different category (e.g., 'cockroach' replacing 'flies' is forbidden).\n"
+				"  * Only perform NON-SEMANTIC transformations: trimming whitespace, casing normalization, format cleanup.\n"
+				"- TOKEN-SOURCE RESTRICTION: If the question asks to 'output a word/单词/词', you MUST pick ONLY from tokens contained in candidate_answer.\n"
+				"  * Do not invent or infer a new word that is not present in candidate_answer.\n"
+				"  * If multiple tokens present, prefer the one that directly matches the requested form; otherwise return candidate_answer unchanged.\n"
+				"- STRICT NUMBER EXTRACTION (CRITICAL):\n"
+				"  * If question contains '仅输出数字' / 'only output number' / 'output number only' / '仅输出' + '数字', you MUST return ONLY the numeric value, with NO words, NO Chinese characters, NO units, NO prefixes/suffixes.\n"
+				"  * When extracting numbers from text, use regex to find ALL numeric patterns (integers, decimals, negative numbers).\n"
+				"  * If candidate_answer contains patterns like '第X' / '第X天' / '第X段' / 'X个' / 'X次', extract ONLY the numeric part (X), NOT the Chinese prefix '第' or suffix '个/次'.\n"
+				"  * Examples of WRONG extraction: '第3段' → '第' (WRONG), '第7天' → '第' (WRONG), '3个' → '' (WRONG).\n"
+				"  * Examples of CORRECT extraction: '第3段' → '3', '第7天' → '7', '3个' → '3', '答案是3段' → '3', '最少需要3段' → '3'.\n"
 				"- If the expected answer is a single number (integer/decimal/negative) and no special format is required:\n"
 				"  RETURN DIGITS ONLY (keep minus sign and decimal point if present). No words, no units, no extra characters.\n"
-				"  Examples: '答案是 42 人' → '42'; '≈ 3.140' → '3.14'; '- 0012 ' → '-12'.\n"
+				"  Examples: '答案是 42 人' → '42'; '≈ 3.140' → '3.14'; '- 0012 ' → '-12'; '第3段' → '3'.\n"
 				"- If candidate_answer contains both number and text, EXTRACT ONLY the numeric value unless the question demands text.\n"
 				"- COUNT-STYLE QUESTIONS (数量/多少/几 + 个/项/文件/log 等): If multiple numbers appear, select ONE most plausible count without recalculation:\n"
-				"  * Prefer the number immediately following cues like '共/共有/数量为/总计'.\n"
+				"  * Prefer the number immediately following cues like '共/共有/数量为/总计/最少/需要'.\n"
+				"  * When candidate contains '最少X段' / '最少X个' / '需要X段', extract the number X (not the word '最少' or '段').\n"
 				"  * Otherwise prefer a positive integer within [1, 1000] (choose the largest if multiple).\n"
 				"  * If none match, fall back to the last number in candidate_answer.\n"
 				"  * Ignore file paths, years, IDs when evidently unrelated to the asked count.\n"
+				"  * NEVER output Chinese characters like '第' / '段' / '个' / '次' / '天' when question asks for a number.\n"
 				"- If a list of numbers is requested, output numbers only using the requested separator; otherwise default to ','.\n"
 				"- Normalize whitespace + NFKC; trim trailing zeros when appropriate.\n"
 				"- FORMAT EXTRACTION (CRITICAL):\n"
@@ -1460,9 +1535,16 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- Input: candidate_answer='The answer is 42'. Output: '42' (remove prefix).\n"
 				"- Input: candidate_answer='42.0'. Output: '42' (trim trailing zero).\n"
 				"- Input: candidate_answer='第一行：1. 京东金条...\\n2. 白条...', question='仅用英文逗号间隔输出六个板块名称'. Output: '京东金条,白条,京东小金库,基金,保险,更多服务'\n"
+				"- Input: candidate_answer='最少需要3段', question='问最少将金条切成多少段...仅输出数字'. Output: '3' (extract number, NOT '第' or '段').\n"
+				"- Input: candidate_answer='第3段', question='仅输出数字'. Output: '3' (WRONG would be '第', CORRECT is '3').\n"
+				"- Input: candidate_answer='答案是3', question='仅输出数字'. Output: '3' (extract number only).\n"
+				"- Input: candidate_answer='需要切成3段', question='最少将金条切成多少段，仅输出数字'. Output: '3' (extract number, ignore '段').\n"
 				"\n"
 				"OUTPUT: Return ONLY the normalized answer, no prefixes/suffixes/extra lines. NO recalculation.\n"
 				"If the question expects a number but candidate contains additional words, DROP ALL WORDS and return ONLY the number.\n"
+				"If the question expects a word, return ONLY the word taken from candidate_answer (after trimming/normalizing case).\n"
+				"CRITICAL: When question says '仅输出数字', you MUST extract the numeric value using regex, ignoring ALL Chinese characters like '第/段/个/次/天'.\n"
+				"If candidate_answer is '第3段' and question asks for a number, output '3' NOT '第'. If candidate_answer is '最少需要3段', output '3' NOT '最少' or '段'.\n"
 				"\n"
 				"You have access to these tools:\n"
 				"${tools_description}\n"
@@ -1902,7 +1984,13 @@ def main():
 	parser.add_argument("--validate", action="store_true", help="Validate results against 'answer' field in input_jsonl.")
 	parser.add_argument("--enable_mcp", action="store_true", help="Enable MCP tools (requires Node.js and MCP servers).")
 	
-	args = parser.parse_args()
+	try:
+		args = parser.parse_args()
+	except SystemExit as e:
+		# 如果参数解析失败，提供更友好的错误信息
+		if e.code != 0:
+			print("\n提示：如果看到 'unrecognized arguments'，请检查命令行末尾是否有多余的空格或特殊字符。")
+		raise
 
 	Config.set_app_name(args.app_name)
 

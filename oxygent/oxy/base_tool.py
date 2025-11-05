@@ -25,7 +25,7 @@ class BaseTool(Oxy):
         True, description="Whether permission is required for execution"
     )
     category: str = Field("tool", description="Tool category identifier")
-    timeout: float = Field(60, description="Timeout in seconds.")
+    timeout: float = Field(600, description="Timeout in seconds.")
 
     async def _execute(self, oxy_request: OxyRequest) -> OxyResponse:
         raise NotImplementedError("This method is not yet implemented")
