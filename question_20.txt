@@ -1,0 +1,7 @@
+问题: Tim rides his bike back and forth to work for each of his 5 workdays.  His work is 20 miles away.  He also goes for a weekend bike ride of 200 miles.    If he can bike at 25 mph how much time does he spend biking a week?
+
+答案: He bikes 20*2=<<20*2=40>>40 miles each day for work
+So he bikes 40*5=<<40*5=200>>200 miles for work
+That means he bikes a total of 200+200=<<200+200=400>>400 miles for work
+So he bikes a total of 400/25=<<400/25=16>>16 hours
+#### 16

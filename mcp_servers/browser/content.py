@@ -131,11 +131,15 @@ async def browser_take_screenshot(
         return f"截取页面截图时发生错误: {str(e)}"
 
 
-@mcp.tool(description="对页面截图进行视觉理解（调用外部视觉LLM）")
+@mcp.tool(description="对页面截图进行视觉理解（调用外部视觉LLM），支持长页多切片并行送入")
 async def browser_analyze_screenshot(
     prompt: str = Field(description="需要从截图中提取/理解的指令，如：'读取页面主按钮文字'"),
     path: str = Field(default="", description="已有截图路径；为空则自动截取当前页面"),
     full_page: bool = Field(default=False, description="是否截取整页（当 path 为空时生效)"),
+    slice_if_tall: bool = Field(default=True, description="当整页过高时是否自动切片后多图送入"),
+    segment_height: int = Field(default=2200, description="单切片高度像素（建议2000-2600）"),
+    max_segments: int = Field(default=4, description="最长页最多切片数（避免超长上下文）"),
+    overlap: int = Field(default=80, description="相邻切片重叠像素，利于跨切片字段识别"),
     model_name: Optional[str] = Field(default=None, description="可选，覆盖环境变量中的视觉模型名"),
 ):
     """
@@ -173,10 +177,48 @@ async def browser_analyze_screenshot(
                 await _set_operation_status(False)
                 return f"提供的截图路径不存在: {screenshot_path}"
 
-        # base64编码图片，拼接data-url
-        with open(screenshot_path, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode("utf-8")
-        img_data_url = f"data:image/png;base64,{img_b64}"
+        # 读取图片，并按需切片
+        from PIL import Image
+        image_paths: List[str] = []
+        if slice_if_tall:
+            try:
+                im = Image.open(screenshot_path).convert("RGB")
+                w, h = im.size
+                if h > segment_height:
+                    top = 0
+                    segs = 0
+                    while top < h and segs < max_segments:
+                        bottom = min(h, top + segment_height)
+                        crop = im.crop((0, top, w, bottom))
+                        # 保存临时切片文件
+                        cache_dir = os.path.join(os.getcwd(), "../", "cache_dir")
+                        os.makedirs(cache_dir, exist_ok=True)
+                        seg_dir = os.path.join(cache_dir, "screenshot")
+                        os.makedirs(seg_dir, exist_ok=True)
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        uid = str(uuid.uuid4())[:8]
+                        seg_name = f"{ts}_{uid}_seg{segs+1}.png"
+                        seg_path = os.path.join(seg_dir, seg_name)
+                        crop.save(seg_path, format="PNG", optimize=True)
+                        image_paths.append(seg_path)
+                        segs += 1
+                        if bottom >= h:
+                            break
+                        top = bottom - max(0, overlap)
+                else:
+                    image_paths.append(screenshot_path)
+            except Exception:
+                # 回退为单图
+                image_paths.append(screenshot_path)
+        else:
+            image_paths.append(screenshot_path)
+
+        # base64编码图片，拼接data-url（多图）
+        img_data_urls: List[str] = []
+        for p in image_paths:
+            with open(p, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode("utf-8")
+            img_data_urls.append(f"data:image/png;base64,{img_b64}")
 
         # 视觉模型参数
         api_key = os.getenv("VL_KEY")
@@ -189,21 +231,12 @@ async def browser_analyze_screenshot(
         # SDK初始化
         client = OpenAI(api_key=api_key, base_url=base_url)
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": img_data_url}
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt
-                    },
-                ]
-            }
-        ]
+        contents = []
+        for url in img_data_urls:
+            contents.append({"type": "image_url", "image_url": {"url": url}})
+        contents.append({"type": "text", "text": prompt})
+
+        messages = [{"role": "user", "content": contents}]
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -235,7 +268,7 @@ async def browser_analyze_screenshot(
                 }
             await _verify_data_ready()
             await _set_operation_status(False)
-            return {"result": str(content), "raw": str(raw_result), "path": screenshot_path}
+            return {"result": str(content), "raw": str(raw_result), "paths": image_paths if len(image_paths)>1 else [screenshot_path]}
         except Exception as e:
             sys.stderr.write(f"VLM调用异常：{str(e)}\n")
             sys.stderr.flush()

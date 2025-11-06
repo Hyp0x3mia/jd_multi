@@ -5,13 +5,14 @@ import os
 import unicodedata
 import time
 import requests
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Literal
 from pathlib import Path
 
 from oxygent import MAS, Config, oxy, preset_tools
 from pydantic import Field
 import importlib.util
 import logging
+
 logger = logging.getLogger(__name__)
 """
 简化的GAIA Runner - 直接使用内置智能体
@@ -55,125 +56,128 @@ def _repo_root() -> str:
 
 
 def _clean_final_answer(text: str) -> str:
-	"""清理最终答案，移除无关信息"""
-	if not text:
-		return ""
-	
-	text = str(text).strip()
-	
-	# 移除常见的前缀
-	prefixes_to_remove = [
-		"答案：", "Answer:", "Result:", "结果：", "输出：", "Output:",
-		"最终答案：", "Final Answer:", "答案是：", "The answer is:",
-		"根据查询结果：", "Based on the search:", "经过分析："
-	]
-	
-	for prefix in prefixes_to_remove:
-		if text.startswith(prefix):
-			text = text[len(prefix):].strip()
-			break
-	
-	# 移除常见的后缀
-	suffixes_to_remove = [
-		"以上就是答案", "This is the answer", "答案如上", "Answer as above"
-	]
-	
-	for suffix in suffixes_to_remove:
-		if text.endswith(suffix):
-			text = text[:-len(suffix)].strip()
-			break
-	
-	# 如果包含多行，需要智能提取最终答案
-	if '\n' in text:
-		lines = [line.strip() for line in text.split('\n') if line.strip()]
-		
-		if lines:
-			# 策略1：优先选择最后一行（通常 normalizer_agent 会把最终答案放在最后）
-			last_line = lines[-1]
-			
-			# 检查最后一行是否看起来完整（不以冒号、逗号等结尾，表示可能是完整的答案）
-			incomplete_markers = ['：', ':', '，', ',', '。', '.', '；', ';']
-			is_incomplete = any(last_line.rstrip().endswith(marker) for marker in incomplete_markers)
-			
-			# 检查是否包含解释性关键词
-			has_explanation_keywords = any(keyword in last_line.lower() for keyword in 
-				['explanation', 'explain', 'reasoning', 'because', '由于', '因为', '解释', '说明', 'according', '根据'])
-			
-			# 如果最后一行不完整或包含解释性关键词，从后往前找完整的答案行
-			if is_incomplete or (has_explanation_keywords and len(last_line) > 100):
-				# 从后往前找第一个看起来像完整答案的行
-				for line in reversed(lines):
-					line_stripped = line.strip()
-					if not line_stripped:
-						continue
-					
-					# 跳过包含解释性关键词的长行
-					has_expl = any(keyword in line_stripped.lower() for keyword in 
-						['explanation', 'explain', 'reasoning', 'because', '由于', '因为', '解释', '说明', 'according', '根据'])
-					line_incomplete = any(line_stripped.rstrip().endswith(marker) for marker in incomplete_markers)
-					
-					# 如果这一行没有解释性关键词且看起来完整，使用它
-					if not has_expl and not line_incomplete:
-						text = line_stripped
-						break
-					# 如果这一行有解释性关键词但很短（可能是简洁答案），也使用它
-					elif has_expl and len(line_stripped) < 50:
-						text = line_stripped
-						break
-			else:
-				# 最后一行看起来完整且没有明显的问题，使用它
-				text = last_line
-	
-	return text
+    """极简清理：仅去首尾空白与NFKC；不做启发式多行选择。"""
+    if not text:
+        return ""
+    s = str(text).strip()
+    return unicodedata.normalize('NFKC', s)
 
 
-def _normalize_answer(text: str) -> str:
-	"""强规范化答案：NFKC归一、数字处理、逗号分割排序等"""
-	if not text:
-		return ""
+def _extract_final_answer(text: str, question: str = "") -> str:
+    """只提取最终答案，忽略所有附加说明。支持数字、百分比、URL、日期、CSV等类型。"""
+    if not text:
+        return ""
+    
+    import re
+    s = str(text).strip()
+    
+    # 先尝试使用确定性流水线（如果问题可用）
+    if question:
+        try:
+            spec = parse_answer_spec(question)
+            extracted = extract_deterministic(spec, s)
+            if not isinstance(extracted, dict) or "error" not in extracted:
+                normalized = normalize_by_spec(spec, extracted)
+                if not isinstance(normalized, dict) or "error" not in normalized:
+                    return str(normalized)
+        except Exception:
+            pass
+    
+    # 回退到通用模式匹配
+    # 1. 百分比数字（如 200%）
+    percent_pattern = r"(-?\d+(?:\.\d+)?%?)"
+    percent_match = re.search(r"(-?\d+(?:\.\d+)?%)", s)
+    if percent_match:
+        return percent_match.group(1).strip()
+    
+    # 2. URL 提取
+    url_pattern = r"https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
+    url_match = re.search(url_pattern, s)
+    if url_match:
+        return url_match.group(0).strip()
+    
+    # 3. 日期提取（处理常见格式：YYYY-MM-DD, YYYY年MM月DD日等）
+    date_pattern = r"(\d{4}[年/-]\d{1,2}[月/-]\d{1,2}[日]?)"
+    date_match = re.search(date_pattern, s)
+    if date_match:
+        date_str = date_match.group(1)
+        # 标准化日期格式：2025年12月25日 → 2025-12-25
+        date_str = re.sub(r"(\d{4})[年/-](\d{1,2})[月/-](\d{1,2})[日]?", r"\1-\2-\3", date_str)
+        return date_str.strip()
+    
+    # 4. 数字（整数、小数、负数）
+    number_pattern = r"(-?\d+(?:\.\d+)?)"
+    number_match = re.search(number_pattern, s)
+    if number_match:
+        return number_match.group(1).strip()
+    
+    # 5. CSV 类型：提取以逗号分隔的值
+    if ',' in s:
+        parts = [p.strip() for p in s.split(',') if p.strip()]
+        if len(parts) > 1:
+            return ','.join(parts)
+    
+    # 6. 默认返回清理后的文本
+    return _clean_final_answer(s)
 
-	# NFKC 归一化
-	text = unicodedata.normalize('NFKC', str(text).strip())
 
-	# 尝试数字转换
-	try:
-		if '.' in text:
-			num = float(text)
-			if num == int(num):
-				return str(int(num))
-			return str(num)
-		else:
-			return str(int(text))
-	except ValueError:
-		pass
-
-	# 回退：不做激进的数字抽取，交由 normalizer_agent 通过提示词约束
-
-	# 逗号分割处理（按规则去空格）
-	if ',' in text:
-		parts = [p.strip() for p in text.split(',')]
-		# 去重，保持顺序
-		unique_parts = list(dict.fromkeys(parts))
-		# 若题目常要求“仅用英文逗号间隔”，默认不加空格
-		return ','.join(unique_parts)
-
-	# 规则化去空格：
-	# 1) 纯数字/数字小数/带符号数字：去掉所有空格
-	compact = text.replace(' ', '')
-	try:
-		_ = float(compact)
-		return compact
-	except ValueError:
-		pass
-
-	# 2) 仅由中英文字母/数字/中文/连字符/下划线/点号构成的短答案：去掉所有空格
-	import re
-	if re.fullmatch(r"[\w\u4e00-\u9fa5\-\.]+( [\w\u4e00-\u9fa5\-\.]+)*", text):
-		return text.replace(' ', '')
-
-	# 3) 其他场景：折叠多余空格为单个，并去首尾空格
-	text = re.sub(r"\s+", " ", text).strip()
-	return text
+def _normalize_answer(text: str, question: str = "") -> str:
+    """强规范化答案：只保留最终答案，不做过多解释。支持多种类型。"""
+    if not text:
+        return ""
+    
+    import re
+    
+    # 先提取答案
+    cleaned_answer = _extract_final_answer(text, question)
+    
+    # 对不同类型的答案进行标准化
+    # 1. 百分比：确保格式正确（如 200%）
+    if '%' in cleaned_answer:
+        cleaned_answer = cleaned_answer.strip()
+        # 确保百分比符号正确
+        if not cleaned_answer.endswith('%'):
+            # 如果数字后面有%但格式不对，修正
+            cleaned_answer = re.sub(r"(\d+(?:\.\d+)?)\s*%?", r"\1%", cleaned_answer)
+    
+    # 2. 纯数字：移除多余空格，处理负数和小数
+    elif re.match(r"^-?\d+(\.\d+)?$", cleaned_answer):
+        cleaned_answer = cleaned_answer.strip()
+        # 如果是整数但写成小数形式（如 12.0），转为整数
+        try:
+            f = float(cleaned_answer)
+            if f.is_integer():
+                cleaned_answer = str(int(f))
+            else:
+                # 去除无意义的尾零
+                cleaned_answer = ("%f" % f).rstrip("0").rstrip(".")
+        except:
+            pass
+    
+    # 3. 日期：标准化为 YYYY-MM-DD 格式
+    if '年' in cleaned_answer or '月' in cleaned_answer or '日' in cleaned_answer:
+        # 尝试格式化日期（2025年12月25日 → 2025-12-25）
+        cleaned_answer = re.sub(r"(\d{4})[年/-](\d{1,2})[月/-](\d{1,2})[日]?", r"\1-\2-\3", cleaned_answer)
+        # 确保月份和日期是两位数
+        parts = cleaned_answer.split('-')
+        if len(parts) == 3:
+            parts[1] = parts[1].zfill(2)
+            parts[2] = parts[2].zfill(2)
+            cleaned_answer = '-'.join(parts)
+    
+    # 4. URL：清理链接
+    if cleaned_answer.startswith("http"):
+        cleaned_answer = cleaned_answer.strip()
+        # 移除尾部标点
+        cleaned_answer = cleaned_answer.rstrip(".,;)")
+    
+    # 5. CSV：确保格式正确（逗号分隔，无多余空格）
+    if ',' in cleaned_answer and len(cleaned_answer.split(',')) > 1:
+        parts = [p.strip() for p in cleaned_answer.split(',') if p.strip()]
+        cleaned_answer = ','.join(parts)
+    
+    # 返回最终答案（去除多余空格）
+    return cleaned_answer.strip()
 
 
 def _classify_task(query: str) -> str:
@@ -769,25 +773,33 @@ def _get_github_issue_by_number(
 github_api_tools = oxy.FunctionHub(name="github_api_tools", timeout=120)
 
 
-@github_api_tools.tool(description="Github.SearchIssues: Search issues/PRs via REST API with structured params")
+@github_api_tools.tool(description="Github.SearchIssues: Search issues/PRs via REST API. Use 'query' for search keywords (e.g., 'whisper audio bug'), 'repo' for repository, 'created' for date range, 'state' for open/closed/all, 'max_results' for result limit.")
 def github_search_issues(
-    repo: str = Field("", description="Repository in owner/repo. Optional if q_extra already includes repo: qualifier"),
+    repo: str = Field("", description="Repository in owner/repo format (e.g., 'huggingface/transformers')"),
+    query: str = Field("", description="Search query keywords (e.g., 'whisper audio bug', '#40054'). This is the main parameter for search terms."),
     labels: str = Field("", description="Comma-separated labels (OR semantics)"),
     milestone: str = Field("", description="Milestone title or number"),
-    created: str = Field("", description="created date range, e.g., '2025-01-01..2025-12-31'"),
-    updated: str = Field("", description="updated date range, e.g., '2025-01-01..2025-12-31'"),
+    created: str = Field("", description="Created date range, e.g., '2025-08-08..2025-08-08'"),
+    updated: str = Field("", description="Updated date range, e.g., '2025-01-01..2025-12-31'"),
     in_: str = Field("", description="Search fields, e.g., 'title,body'"),
-    state: str = Field("all", description="open|closed|all"),
-    q_extra: str = Field("", description="Extra free-text query qualifiers, e.g., 'whisper audio bug'"),
-    per_page: int = Field(10, description="results per page (<=100)"),
-    page: int = Field(1, description="page number")
+    state: Literal["open", "closed", "all"] = Field("all", description="Issue state: open, closed, or all"),
+    q_extra: str = Field("", description="[DEPRECATED] Use 'query' instead. Extra free-text query qualifiers."),
+    per_page: int = Field(10, description="Results per page (<=100)"),
+    max_results: int = Field(10, description="Maximum number of results to return (alias for per_page)"),
+    page: int = Field(1, description="Page number")
 ) -> List[Dict]:
     """
     Build GitHub search query and call /search/issues. Fallback: if only repo provided with no text, add 'is:issue'.
     Returns a list of structured items with minimal fields for downstream use.
     """
     headers = _get_github_headers()
-    per_page = max(1, min(100, per_page))
+    # Use max_results if provided (and different from default), otherwise use per_page
+    # If max_results is explicitly set (not default 10), use it; otherwise use per_page
+    if max_results != 10:  # If max_results was explicitly set (not default)
+        per_page = max(1, min(100, max_results))
+    else:
+        per_page = max(1, min(100, per_page))
+    
     terms: List[str] = []
     if repo:
         terms.append(f"repo:{repo}")
@@ -808,15 +820,17 @@ def github_search_issues(
         # support comma list
         for field in [s.strip() for s in in_.split(',') if s.strip()]:
             terms.append(f"in:{field}")
-    if q_extra:
-        terms.append(q_extra)
+    # Use 'query' parameter first, fallback to 'q_extra' for backward compatibility
+    search_text = query.strip() if query else (q_extra.strip() if q_extra else "")
+    if search_text:
+        terms.append(search_text)
     # API requires is:issue|is:pull-request when no free-text sometimes; add is:issue by default
     if not any(t.startswith("is:") for t in terms):
         terms.append("is:issue")
 
-    query = " ".join(terms)
-    logger.info(f"Github.SearchIssues → q={query}")
-    params = {"q": query, "per_page": per_page, "page": page, "sort": "updated", "order": "desc"}
+    search_query = " ".join(terms)
+    logger.info(f"Github.SearchIssues → q={search_query}")
+    params = {"q": search_query, "per_page": per_page, "page": page, "sort": "updated", "order": "desc"}
     try:
         resp = requests.get("https://api.github.com/search/issues", headers=headers, params=params, timeout=30)
         if resp.status_code == 403:
@@ -953,8 +967,8 @@ def sanity_validate_answer(answer: str = Field(..., description="raw answer"), s
 def search_github_issues(
 	repo: str = Field(..., description="Repository name in owner/repo format (e.g., 'huggingface/transformers')"),
 	query: str = Field("", description="Search query string (e.g., '#40054', 'audio whisper', 'bug')"),
-	state: str = Field("all", description="Issue state", enum=["open", "closed", "all"]),
-	issue_type: str = Field("all", description="Type of items", enum=["issue", "pr", "all"]),
+	state: Literal["open", "closed", "all"] = Field("all", description="Issue state"),
+	issue_type: Literal["issue", "pr", "all"] = Field("all", description="Type of items"),
 	max_results: int = Field(10, description="Maximum number of results to return", ge=1, le=100)
 ) -> List[Dict]:
 	"""
@@ -1032,7 +1046,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
         timeout=240
     ),
         oxy.HttpLLM(
-        name='inclusionAI/Ring-1T',
+        name='Reasoning Model',
         api_key=os.getenv('DEEPSEEK_R1_KEY'),
         base_url=os.getenv('DEEPSEEK_URL'),
         model_name=os.getenv('DEEPSEEK_R1'),
@@ -1067,6 +1081,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 		semaphore=2,
 		desc="视觉大模型（支持图像理解、截图问答）",
 		is_multimodal_supported=True,
+		timeout = 600
 		),
 		# 预置工具
 		preset_tools.time_tools,
@@ -1118,6 +1133,32 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 	)
 	oxy_space.append(audio_mcp)
 
+	# 注册 Case Bank MCP
+	try:
+		case_bank_mcp = oxy.StdioMCPClient(
+			name="mcp-case-bank",
+			params={
+				"command": "uv",
+				"args": ["--directory", "./mcp_servers/mcp-case-bank", "run", "server.py"],
+			},
+		)
+		oxy_space.append(case_bank_mcp)
+	except Exception as e:
+		print(f"Warning: Could not add mcp-case-bank: {e}")
+
+	# 注册 To-Do MCP
+	try:
+		todo_mcp = oxy.StdioMCPClient(
+			name="mcp-todo",
+			params={
+				"command": "uv",
+				"args": ["--directory", "./mcp_servers/mcp-todo", "run", "server.py"],
+			},
+		)
+		oxy_space.append(todo_mcp)
+	except Exception as e:
+		print(f"Warning: Could not add mcp-todo: {e}")
+
 	# 注册新版 GitHub 稳定 API 工具与 Guardrails/Sanity（供 web_agent 优先使用）
 	oxy_space.append(github_api_tools)
 	oxy_space.append(github_guardrails)
@@ -1157,17 +1198,58 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			name="math_agent",
 			desc="Math/Logic Specialist – deterministically solve problems via Python.",
 			tools=["python_tools", "math_tools"],
-			llm_model="default_llm",
+			llm_model="Reasoning Model",
 			additional_prompt=(
 				"ROLE: Math/Logic Specialist\n"
-				"CAPABILITIES: Arithmetic, combinatorics, averages, date arithmetics, small enumeration using Python.\n"
+				"CAPABILITIES: Arithmetic, combinatorics, averages, date arithmetics, small enumeration, information theory, binary encoding, optimization problems, constraint satisfaction using Python.\n"
+				"\n"
+				"PROBLEM-SOLVING METHODOLOGY:\n"
+				"1) UNDERSTAND CONSTRAINTS FIRST:\n"
+				"   - Read the problem carefully and identify ALL constraints (time limits, resource limits, detection rules, etc.).\n"
+				"   - For problems involving multiple rounds/steps, identify what can be done in each round and what information is available.\n"
+				"   - Example: '48小时内用最少的兔子找出毒桶，无法区分中毒先后，且第二次实验需等待24小时' → \n"
+				"     * Round 1: 0-24h (给兔子饮水), 24h (观察结果)\n"
+				"     * Round 2: 24-48h (根据Round1结果给兔子饮水), 48h (观察结果)\n"
+				"     * Constraint: Cannot distinguish which round caused death\n"
+				"\n"
+				"2) INFORMATION THEORY APPROACH:\n"
+				"   - For detection/identification problems: Calculate the information capacity needed.\n"
+				"   - If N buckets and need to identify 1, you need at least log2(N) bits of information.\n"
+				"   - Each rabbit can provide 1 bit per round (dead/alive), but with constraints, you may need more.\n"
+				"   - Use binary encoding: Assign each bucket a unique binary code, assign rabbits to bit positions.\n"
+				"   - For single-round problems: N buckets need ⌈log2(N)⌉ rabbits minimum.\n"
+				"   - For multi-round problems: Consider whether additional rounds allow optimization below the single-round bound.\n"
+				"   - IMPORTANT: Always verify your solution can actually identify all possible cases - don't just rely on theoretical bounds.\n"
+				"\n"
+				"3) SYSTEMATIC ANALYSIS:\n"
+				"   - For problems with multiple rounds: Model each round separately, then combine.\n"
+				"   - For constraint problems: Use Python to enumerate small cases, verify logic, then generalize.\n"
+				"   - For optimization problems ('最少/最多'): Try different strategies, compare results, choose optimal.\n"
+				"\n"
+				"4) VERIFICATION:\n"
+				"   - After computing an answer, verify it meets ALL constraints.\n"
+				"   - For detection problems: Verify that your solution can indeed identify the target in all cases.\n"
+				"   - If answer seems too high, reconsider your strategy or check if you're missing an optimization.\n"
+				"\n"
 				"POLICY:\n"
 				"- Prefer exact computation with python_tools/math_tools.\n"
+				"- For complex logic problems, break down into steps:\n"
+				"  1) Analyze constraints and information flow\n"
+				"  2) Design encoding/strategy\n"
+				"  3) Implement and verify with Python\n"
+				"  4) Check optimality\n"
 				"- Keep chain-of-thought internal; only output results.\n"
+				"- When solving '最少需要X' problems, consider:\n"
+				"  * Information theory lower bounds\n"
+				"  * Alternative strategies that might be more efficient\n"
+				"  * Whether constraints allow full information extraction\n"
+				"  * Try different numbers and verify which is the minimum that works\n"
+				"\n"
 				"OUTPUT:\n"
 				"- Return ONLY the final number/string needed by the question (no units unless requested).\n"
+				"- For '最少需要X' problems, output the minimum number that satisfies all constraints.\n"
 			),
-			timeout=60,
+			timeout=300,
 		)
 	)
 	
@@ -1216,6 +1298,24 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"   - When using browser_navigate, prefer wait_until='domcontentloaded' to reduce waiting time.\n"
 				"   - Use full-page screenshots when the target may appear outside the initial viewport; otherwise prefer minimal screenshots.\n"
 				"4) If visual content required (text in image, buttons, tables), call browser_analyze_screenshot with a precise, minimal prompt.\n"
+				"HIT_POLICY (CRITICAL - HARD STOP):\n"
+				"- Once any API/URL/page content yields sufficient, directly usable evidence (exact number/date/name/link/table row), you MUST STOP all further search/navigation.\n"
+				"- After HIT: Only one optional local extraction (on current result/page) is allowed; then finalize.\n"
+				"- Prohibited after HIT: search_github_issues, search_baidu, browser_navigate to a new site, or any external search.\n"
+				"IDEMPOTENCE / DEDUP (STRICT):\n"
+				"- Within a single task, you may call each search tool at most once per normalized query signature.\n"
+				"- Do NOT repeat identical or trivially similar queries (case-insensitive, trimmed, stop-words removed).\n"
+				"- If a search returned results already analyzed, do not call search again — switch to analysis or extraction.\n"
+				"BUDGET (LIMITS):\n"
+				"- search_* tools: budget = 1 per task unless first returned empty; one retry allowed only if you REDUCE keywords.\n"
+				"- If API hit (Github.SearchIssues/GetIssue) already provides the needed value, browser budget = 0 (skip browser).\n"
+				"VISUAL-FIRST HEURISTICS (IMAGE/TEXT-IN-IMAGE CASES):\n"
+				"- If the query mentions or implies values often embedded in images (e.g., 证书/收藏证书/编号/第…号/海报/公告/票据/榜单/截图/照片), prioritize on-page visual extraction over external search.\n"
+				"  1) Navigate/open the candidate page (if already on page, skip search).\n"
+				"  2) Take a screenshot (full_page=true when content may be below the fold).\n"
+				"  3) Call browser_analyze_screenshot with a precise prompt to OCR the target field only.\n"
+				"  4) Use regex-like extraction guidance in the prompt, e.g., 提取“总第…号/第…号/证书编号/No.”等字样后的编号，输出数字或编号本体。\n"
+				"- After a successful visual hit, STOP all searches and finalize.\n"
 				"POLICY:\n"
 				"- Keep steps minimal: search → analyze results → extract → STOP.\n"
 				"- Prefer primary sources and exact matches.\n"
@@ -1318,12 +1418,20 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"ROLE: File Specialist\n"
 				"SCOPE: Extract content FROM files (text from PDFs, images, documents).\n"
 				"LIMITATIONS: This agent does NOT count files or list directories. For counting/statistics tasks, return 'UNABLE_TO_PROCESS: This task requires counting/statistics, please use math_agent with Python code.'\n"
-				"POLICY:\n"
-				"- Detect file type first; extract only requested fields.\n"
-				"- If task asks to count files/list directory items, return the UNABLE_TO_PROCESS message above.\n"
+				"WORKFLOW (DECOMPOSE → EXECUTE → VERIFY):\n"
+				"1) READ FULL QUERY: Always read the entire query including any 'File_Name:' line.\n"
+				"2) PLAN SHORT STEPS (max 3-5): Break complex tasks into minimal atomic steps (e.g., 'render PDF page→extract field A→extract field B').\n"
+				"3) EXECUTE STEP-BY-STEP: For each step, call the appropriate tool with the FULL query string (including 'File_Name: ...'). Use doc_analyze for image/PDF (vision extraction).\n"
+				"4) VERIFY PROGRESS: After each step, check if the requested field is obtained with sufficient confidence. If yes, proceed to finalize; if not, do the next smallest step.\n"
+				"5) STOP EARLY: As soon as required info is extracted, stop further steps and finalize.\n"
+				"TOOL USAGE RULES:\n"
+				"- Prefer passing the full original query (contains path context) as the tool 'prompt' to ensure the tool knows the path.\n"
+				"- If multiple files under 'File_Name:' are provided, process the FIRST relevant one unless the question requires multiple.\n"
+				"- For PDF/image: allow high-DPI render; take full-page if the target may be off-screen.\n"
+				"- Avoid repeated identical calls. Change prompt or focus region if a retry is necessary.\n"
 				"OUTPUT: Return only the minimal text/value(s) required by the question, OR the UNABLE_TO_PROCESS message if task is outside scope.\n"
 			),
-			timeout=300,
+			timeout=600,
 		)
 	)
 
@@ -1363,53 +1471,77 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 		oxy_space.append(
 			oxy.ReActAgent(
 				name="audio_agent",
-				desc="Audio Transcription Agent – SenseVoice (SiliconFlow).",
+				desc="Audio Processing Agent – ASR transcription and song recognition via audio fingerprint.",
 				tools=["audio_tools"],
 				llm_model="default_llm",
 				prompt=(
-					"ROLE: ASR Specialist\n"
+					"ROLE: Audio Processing Specialist\n"
 					"\n"
-					"Your ONLY job is to transcribe audio files to text using the audio_transcribe tool.\n"
+					"Your job is to process audio files using TWO tools: audio transcription (ASR) and song recognition (audio fingerprint).\n"
 					"\n"
-					"TOOL AVAILABLE:\n"
-					"- Tool name: audio_transcribe\n"
-					"- Required parameter: path (the full file path to the audio file)\n"
-					"- Supported formats: .wav, .mp3, .m4a, .flac\n"
+					"TOOLS AVAILABLE:\n"
+					"1) audio_transcribe: Transcribe audio to text (lyrics/speech) using ASR\n"
+					"   - Parameter: path (full file path)\n"
+					"   - Returns: transcribed text or error\n"
+					"   - Best for: lyrics, speech, or any audio with text content\n"
+					"\n"
+					"2) audio_recognize_song: Identify song by audio fingerprint (Chromaprint + AcoustID)\n"
+					"   - Parameter: path (full file path)\n"
+					"   - Returns: song title, artist, or error\n"
+					"   - Best for: music files (especially instrumental/pure music without clear lyrics)\n"
 					"\n"
 					"FILE PATH EXTRACTION:\n"
 					"The query may contain file path information in one of these formats:\n"
 					"1) Explicit file path in the query text (e.g., '/path/to/audio.wav')\n"
-					"2) File_Name field: The query may include a line like 'File_Name: /path/to/file.wav' or 'File_Name: /path1.wav /path2.wav'\n"
+					"2) File_Name field: The query may include a line like 'File_Name: /path/to/file.wav'\n"
 					"3) Extract the FIRST audio file path you find (if multiple, use the first one).\n"
 					"\n"
-					"PROCESS:\n"
-					"1) Search the query for audio file paths (ending in .wav/.mp3/.m4a/.flac).\n"
-					"2) If query contains 'File_Name:' line, extract the path(s) after the colon.\n"
-					"3) If File_Name contains multiple paths (space-separated), use the first audio file.\n"
-					"4) Extract the complete, absolute file path.\n"
-					"5) Call audio_transcribe with the extracted path.\n"
+					"PROCESSING STRATEGY (FLEXIBLE - USE BOTH TOOLS):\n"
+					"1) Extract the audio file path from the query.\n"
+					"2) Try audio_transcribe FIRST to get lyrics/transcription:\n"
+					"   - If successful and returns meaningful text (lyrics/speech), return that.\n"
+					"   - If returns error or empty/unclear text, proceed to step 3.\n"
+					"3) If transcription fails or query asks for song information, try audio_recognize_song:\n"
+					"   - If successful, return song title and artist.\n"
+					"   - If fails, return error message.\n"
+					"\n"
+					"DECISION LOGIC:\n"
+					"- If query asks for '歌词/lyrics/transcription/text content' → prioritize audio_transcribe\n"
+					"- If query asks for '歌曲名/song name/artist/歌手' → try audio_recognize_song first, fallback to audio_transcribe\n"
+					"- If query is general ('识别/identify/这是什么/what is this') → try both tools, use whichever succeeds\n"
+					"- If one tool succeeds, you can return that result immediately (no need to call the other)\n"
+					"- If both tools are needed for complete answer, call both and combine results\n"
 					"\n"
 					"TOOL CALL FORMAT:\n"
-					"When you need to call the tool, respond with JSON:\n"
-					'{"think": "Extracted audio file path: /path/to/audio.wav", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/audio.wav"}}\n'
+					"When calling tools, respond with JSON:\n"
+					'{"think": "Extracted path: /path/to/audio.mp3. Trying audio_transcribe first...", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/audio.mp3"}}\n'
+					'Or: {"think": "Transcription failed, trying song recognition...", "tool_name": "audio_recognize_song", "arguments": {"path": "/path/to/audio.mp3"}}\n'
+					"\n"
+					"RESPONSE HANDLING:\n"
+					"- audio_transcribe response:\n"
+					"  * If contains 'text' field with meaningful content → Return '【音频转写】' + text\n"
+					"  * If contains 'error' → Try audio_recognize_song as fallback\n"
+					"- audio_recognize_song response:\n"
+					"  * If contains 'title' and 'artist' → Return '【音频识别】歌曲: {title}, 艺术家: {artist}'\n"
+					"  * If contains 'error' → Return error message\n"
 					"\n"
 					"EXAMPLES:\n"
-					"- Query: 'Transcribe this audio\\nFile_Name: /Users/.../audio.wav' → Extract '/Users/.../audio.wav'\n"
-					"- Query: 'What does this audio say? File_Name: /path/to/sound.mp3' → Extract '/path/to/sound.mp3'\n"
-					"\n"
-					"After receiving tool response:\n"
-					"- If response contains 'text' field: extract it and return as '【音频转写】' + text\n"
-					"- If response contains 'error': return the error message\n"
+					"- Query: '识别这首歌的名字' → Try audio_recognize_song first\n"
+					"- Query: '转写这段音频的歌词' → Try audio_transcribe first\n"
+					"- Query: '这是什么歌曲？File_Name: /path/to/song.mp3' → Try audio_recognize_song, fallback to audio_transcribe if needed\n"
 					"\n"
 					"OUTPUT FORMAT:\n"
-					"Return ONLY: '【音频转写】' + transcribed text (no extra commentary, no explanations).\n"
+					"- If transcription succeeds: Return '【音频转写】' + transcribed text\n"
+					"- If song recognition succeeds: Return '【音频识别】歌曲: {title}, 艺术家: {artist}'\n"
+					"- If both succeed: You can combine both results\n"
+					"- If both fail: Return error message\n"
 					"\n"
 					"You have access to these tools:\n"
 					"${tools_description}\n"
 					"\n"
-					"CRITICAL: You MUST call the audio_transcribe tool when an audio file path is detected. Do not skip tool calling."
+					"CRITICAL: Use BOTH tools flexibly. If one fails, try the other. If one succeeds, you can return that result."
 				),
-				timeout=120,
+				timeout=600,
 			)
 		)
 	
@@ -1417,58 +1549,31 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 	oxy_space.append(
 		oxy.ReActAgent(
 			name="normalizer_agent",
-			desc="Strict Normalizer – enforce final-answer formatting.",
+			desc="Answer Validator – validate and optionally normalize answer format (no recalculation).",
 			tools=["string_tools"],
 			llm_model="zai-org/GLM-4.5",
 			prompt=(
-				"ROLE: STRICT Answer Normalizer\n"
-				"\n"
-				"INPUT: {question, candidate_answer}\n"
-				"\n"
-				"CRITICAL RULE - NO RECALCULATION:\n"
-				"- The candidate_answer is ALREADY the final computed result from specialist agents.\n"
-				"- Your job is ONLY formatting/normalization, NOT re-computing or re-calculating.\n"
-				"- If candidate_answer is a number (e.g., '11'), return it AS-IS. Do NOT calculate 1+1=2 or any further operations.\n"
-				"- If candidate_answer is already correct, return it unchanged (only clean formatting).\n"
-				"\n"
-				"RULES:\n"
-				"- Remove ALL explanations/reasoning/units/prefix/suffix unless explicitly requested.\n"
-				"- If the expected answer is a single number (integer/decimal/negative) and no special format is required:\n"
-				"  RETURN DIGITS ONLY (keep minus sign and decimal point if present). No words, no units, no extra characters.\n"
-				"  Examples: '答案是 42 人' → '42'; '≈ 3.140' → '3.14'; '- 0012 ' → '-12'.\n"
-				"- If candidate_answer contains both number and text, EXTRACT ONLY the numeric value unless the question demands text.\n"
-				"- COUNT-STYLE QUESTIONS (数量/多少/几 + 个/项/文件/log 等): If multiple numbers appear, select ONE most plausible count without recalculation:\n"
-				"  * Prefer the number immediately following cues like '共/共有/数量为/总计'.\n"
-				"  * Otherwise prefer a positive integer within [1, 1000] (choose the largest if multiple).\n"
-				"  * If none match, fall back to the last number in candidate_answer.\n"
-				"  * Ignore file paths, years, IDs when evidently unrelated to the asked count.\n"
-				"- If a list of numbers is requested, output numbers only using the requested separator; otherwise default to ','.\n"
-				"- Normalize whitespace + NFKC; trim trailing zeros when appropriate.\n"
-				"- FORMAT EXTRACTION (CRITICAL):\n"
-				"  * If question requests a specific format (e.g., 'comma-separated', '仅用英文逗号间隔', '以逗号分隔'), extract items from candidate_answer and output in that format.\n"
-				"  * If candidate_answer contains a list/description but question asks for 'names only' or 'comma-separated', extract ONLY the item names/titles.\n"
-				"  * Example: candidate_answer='1. 京东金条 - 信贷服务\\n2. 白条 - 信用支付', question='六个板块，仅用英文逗号间隔输出' → Output: '京东金条,白条'\n"
-				"- Lists: split → trim → deduplicate → preserve order (unless sorting required) → join with requested separator (default: ', ').\n"
-				"  * If question specifies separator (e.g., '英文逗号', 'comma'), use that exact separator.\n"
-				"  * If question says '仅用英文逗号间隔' or 'comma-separated', use ',' (no space).\n"
-				"- Dates: honor requested format; default to YYYY-MM-DD.\n"
-				"- Chinese answers: preserve wording strictly.\n"
-				"- If specific form requested (word/URL/name/number), output ONLY that content.\n"
-				"\n"
+				"ROLE: Answer Validator (只验不改值)\n\n"
+				"INPUT: query (contains question and candidate_answer)\n\n"
+				"MANDATE:\n"
+				"- DO NOT recalculate or invent new answers.\n"
+				"- DO NOT change the semantic meaning of candidate_answer.\n"
+				"- Only validate format and return the candidate_answer if valid, or return a simple error message.\n\n"
+				"PROCESS:\n"
+				"1) Extract question and candidate_answer from the query.\n"
+				"2) Check if candidate_answer matches the expected format:\n"
+				"   - For numbers: should be pure digits (with optional sign/decimal point), no extra text.\n"
+				"   - For URLs: should be valid http(s) URL.\n"
+				"   - For dates: should be in YYYY-MM-DD format.\n"
+				"   - For CSV: should be comma-separated values.\n"
+				"3) If valid, return the candidate_answer as-is (no reformatting).\n"
+				"4) If invalid, return a simple text message like 'invalid_format' (no JSON).\n\n"
 				"EXAMPLES:\n"
-				"- Input: candidate_answer='11', question='sum of digits'. Output: '11' (NOT '2', because 11 is already the final answer).\n"
-				"- Input: candidate_answer='The answer is 42'. Output: '42' (remove prefix).\n"
-				"- Input: candidate_answer='42.0'. Output: '42' (trim trailing zero).\n"
-				"- Input: candidate_answer='第一行：1. 京东金条...\\n2. 白条...', question='仅用英文逗号间隔输出六个板块名称'. Output: '京东金条,白条,京东小金库,基金,保险,更多服务'\n"
-				"\n"
-				"OUTPUT: Return ONLY the normalized answer, no prefixes/suffixes/extra lines. NO recalculation.\n"
-				"If the question expects a number but candidate contains additional words, DROP ALL WORDS and return ONLY the number.\n"
-				"\n"
-				"You have access to these tools:\n"
-				"${tools_description}\n"
-				"\n"
-				"Use tools only if needed for normalization (e.g., extract URLs/emails if specifically requested). "
-				"Otherwise, return the normalized candidate_answer directly WITHOUT any recalculation."
+				"- Input: 'Question: What is 2+2? Candidate: 4' → Output: '4'\n"
+				"- Input: 'Question: What is 2+2? Candidate: The answer is 4' → Output: '4' (extract number only)\n"
+				"- Input: 'Question: What is 2+2? Candidate: I think it's 5' → Output: 'invalid_format'\n\n"
+				"OUTPUT:\n"
+				"Return ONLY the validated answer (same as candidate if valid), or 'invalid_format' if invalid. Do NOT use JSON format."
 			),
 			timeout=30,
 		)
@@ -1528,6 +1633,14 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"router_agent", "math_agent", "time_agent", 
 				"web_agent", "audio_agent", "file_agent","directory_agent", "normalizer_agent"
 			],
+			tools=[
+				# guard & utils
+				"python_tools", "final_answer_guard",
+				# case bank tools
+				"casebank_ping", "case_save", "case_search", "case_update_score", "case_get",
+				# todo tools
+				"todo_ping", "todo_create", "todo_list", "todo_update", "todo_autogen_from_case", "todo_link_case", "todo_stats"
+			],
 			llm_model="zai-org/GLM-4.6",
 			additional_prompt=(
 				"ROLE: Master Coordinator\n"
@@ -1548,7 +1661,10 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"     * '当前'/'current'/'now'/'现在' keywords in time context\n"
 				"   - After supplementing information, continue to step 1.\n"
 				"   - IMPORTANT: If the query already contains explicit date/time (e.g., '2025-11-03', 'October 15'), you may skip this step.\n"
-				"1) Route: Call router_agent with the COMPLETE query (including File_Name if present, and any supplemented information). Router needs full context to classify correctly.\n"
+				"1) Case Lookup (BEFORE planning): Call case_search with {query, signature?}. If items found and score≥SIM_THRESHOLD, load the first item's plan as plan_template (do NOT change the final goal).\n"
+				"   - signature may include {task_type, answer_type, level}.\n"
+				"   - Keep evidence in logs (case_id, score).\n"
+				"2) Route: Call router_agent with the COMPLETE query (including File_Name if present, and any supplemented information). Router needs full context to classify correctly.\n"
 				"2) Delegate: Call the appropriate specialist based on router_agent's classification.\n"
 				"   CRITICAL for file/audio agents: When calling audio_agent or file_agent, you MUST pass the FULL query string (including the File_Name field). These agents need the file path information.\n"
 				"   Example: If query contains 'File_Name: /path/to/audio.wav', pass the entire query including that line to audio_agent.\n"
@@ -1563,8 +1679,13 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"   - If file_agent returns error/empty/unable_to_process (especially for counting/statistics tasks), automatically retry with math_agent.\n"
 				"   - If any agent fails but task involves counting/statistics/calculation, use math_agent as fallback.\n"
 				"   - If web_agent returns incomplete or unclear information, you may retry with more specific query or different extraction method.\n"
-				"4) Normalize (MANDATORY): After any specialist returns a candidate, ALWAYS call normalizer_agent with {question, candidate_answer}.\n"
-				"5) Finalize: Output ONLY the normalized answer.\n"
+				"4) Normalize (OPTIONAL): After any specialist returns a candidate, you MAY call normalizer_agent with query containing both question and candidate_answer.\n"
+				"   - Format: 'Question: [original question] Candidate: [specialist agent output]'\n"
+				"   - If normalizer_agent returns 'invalid_format', use the candidate_answer directly.\n"
+				"   - If normalizer_agent returns a valid answer, use that as the final answer.\n"
+				"5) Commit Final Answer (GUARD): After normalization, call final_answer_guard('commit', answer, answer_type). If commit succeeds, proceed.\n"
+				"6) Persist Case (AFTER success): If guard commit succeeded, call case_save(...) then case_update_score(success:true, latency_ms?).\n"
+				"7) On Failure/Timeout: call case_update_score(success:false) and todo_autogen_from_case({case_id, reason, attach}).\n"
 				"RULES:\n"
 				"- ALWAYS check for missing information (especially time) BEFORE routing.\n"
 				"- When calling router_agent, pass the FULL query string (including any File_Name context and supplemented information).\n"
@@ -1587,10 +1708,25 @@ async def run_single(question: str, enable_mcp: bool = False) -> str:
 	async with MAS(oxy_space=oxy_space) as mas:
 		resp = await mas.call(callee="master_agent", arguments={"query": question})
 		answer = resp.output if hasattr(resp, "output") else str(resp)
-		
-		# 清理输出，只保留最终答案
-		cleaned_answer = _clean_final_answer(answer)
-		return _normalize_answer(cleaned_answer)
+		# 确定性流水线：spec → extract → normalize → commit
+		spec = parse_answer_spec(question)
+		extracted = extract_deterministic(spec, answer)
+		normalized = normalize_by_spec(spec, extracted)
+		if isinstance(normalized, dict) and normalized.get("error"):
+			# 回退到原轻量清洗，保证不崩溃
+			cleaned_answer = _clean_final_answer(answer)
+			return _normalize_answer(cleaned_answer, question)
+		# 提交到最终答案守门器（一次提交，不可覆盖）
+		try:
+			from oxygent.preset_tools.python_tools import final_answer_guard as _guard
+			atype = {
+				"integer": "number", "float": "float", "fraction": "fraction",
+				"url": "string", "csv": "string", "date": "string", "text": "string"
+			}.get(spec.type, "string")
+			_ = await _guard(action="commit", answer=normalized, answer_type=atype)
+		except Exception:
+			pass
+		return str(normalized)
 
 
 # def compose_question(item: Dict[str, Any]) -> str:
@@ -1638,6 +1774,190 @@ def _parse_maybe_list(file_name: Union[str, List[str], None]) -> List[str]:
             pass
     return [s]
 
+# ================= Deterministic Normalization Pipeline =================
+class AnswerSpec:
+    def __init__(self, type_: str = "text", separator: str = ",", constraints: Dict[str, Any] = None):
+        self.type = type_
+        self.separator = separator
+        self.constraints = constraints or {}
+
+def parse_answer_spec(question: str) -> AnswerSpec:
+    q = (question or "").lower()
+    import re
+    # csv hints
+    if any(k in q for k in ["仅用英文逗号间隔", "逗号分隔", "comma-separated", "用英文逗号", "以逗号分隔"]):
+        return AnswerSpec("csv", ",")
+    # url hints
+    if any(k in q for k in ["url", "网址", "链接", "http", "https"]):
+        return AnswerSpec("url")
+    # fraction explicit
+    if any(k in q for k in ["分数", "fraction", "p/q"]):
+        return AnswerSpec("fraction")
+    # date hints
+    if any(k in q for k in ["日期", "时间", "date", "年", "月", "日", "什么时候", "年月日"]):
+        return AnswerSpec("date")
+    # percentage hints (百分比)
+    if any(k in q for k in ["百分比", "percent", "%", "同比增长", "增长", "下降", "上升"]):
+        # 如果问题涉及百分比，返回 float 类型（可以包含%符号）
+        return AnswerSpec("float")
+    # number hints → integer/float
+    if any(k in q for k in ["仅输出数字", "只输出数字", "only output number", "仅输出数值", "数值即可", "输出数值", "答案是", "最少", "最多", "共", "总计", "需要", "多少", "数值"]):
+        if any(k in q for k in ["小数", "decimal", "保留", "位"]):
+            return AnswerSpec("float")
+        return AnswerSpec("integer")
+    return AnswerSpec("text")
+
+def _strip_markdown(text: str) -> str:
+    import re
+    if not text:
+        return ""
+    # trim and normalize quotes
+    s = str(text).strip()
+    # code fences
+    s = re.sub(r"```[ \t]*([A-Za-z0-9_\-]+)?\n?([\s\S]*?)```", lambda m: m.group(2).strip(), s)
+    s = re.sub(r"^```[ \t]*[A-Za-z0-9_\-]*", "", s)
+    # inline code / bold / italics
+    s = re.sub(r"`([^`]+)`", lambda m: m.group(1), s)
+    s = re.sub(r"\*\*([^*]+)\*\*", lambda m: m.group(1), s)
+    s = re.sub(r"__([^_]+)__", lambda m: m.group(1), s)
+    s = re.sub(r"\*([^*]+)\*", lambda m: m.group(1), s)
+    # bullets
+    s = re.sub(r"^\s*[-•\*]\s+", "", s)
+    return s.strip().strip('"').strip("'")
+
+def extract_deterministic(spec: AnswerSpec, text: str) -> Union[str, Dict[str, Any]]:
+    import re
+    s = _strip_markdown(text)
+    if spec.type == "fraction":
+        m = list(re.finditer(r"(-?\d+)\s*/\s*(-?\d+)", s))
+        if not m:
+            return {"error": "no_fraction_found"}
+        num = int(m[-1].group(1)); den = int(m[-1].group(2))
+        if den == 0:
+            return {"error": "division_by_zero"}
+        from math import gcd
+        g = gcd(abs(num), abs(den)) or 1
+        num//=g; den//=g
+        if den < 0:
+            num, den = -num, -den
+        return f"{num}/{den}"
+    if spec.type == "date":
+        # 日期提取：支持多种格式
+        date_patterns = [
+            r"(\d{4})[年/-](\d{1,2})[月/-](\d{1,2})[日]?",  # 2025年12月25日
+            r"(\d{4})-(\d{1,2})-(\d{1,2})",  # 2025-12-25
+            r"(\d{4})/(\d{1,2})/(\d{1,2})",  # 2025/12/25
+        ]
+        for pattern in date_patterns:
+            m = list(re.finditer(pattern, s))
+            if m:
+                date_match = m[-1]
+                year = date_match.group(1)
+                month = date_match.group(2).zfill(2)
+                day = date_match.group(3).zfill(2)
+                return f"{year}-{month}-{day}"
+        return {"error": "no_date_found"}
+    if spec.type in ("integer", "float"):
+        # 百分比优先（如果问题涉及百分比）
+        percent_match = re.search(r"(-?\d+(?:\.\d+)?%)", s)
+        if percent_match:
+            return percent_match.group(1).strip()
+        
+        cue_pattern = r"(最少|最多|共|总计|需要|仅输出数字|答案是|同比增长|增长|下降|上升|数值)"
+        nums = list(re.finditer(r"-?\d+(?:\.\d+)?", s))
+        if not nums:
+            return {"error": "no_number_found"}
+        val = None
+        cue_iter = list(re.finditer(cue_pattern, s))
+        if cue_iter:
+            last_cue_end = cue_iter[-1].end()
+            for m in nums:
+                if m.start() >= last_cue_end:
+                    val = m.group(0)
+                    break
+        if val is None:
+            val = nums[-1].group(0)
+        if spec.type == "integer":
+            try:
+                f = float(val)
+                return str(int(round(f)))
+            except:
+                return re.sub(r"\.0+$", "", val)
+        try:
+            f = float(val)
+            return ("%f" % f).rstrip("0").rstrip(".")
+        except:
+            return val
+    if spec.type == "url":
+        m = list(re.finditer(r"https?://[^\s)\]>]+", s, flags=re.IGNORECASE))
+        if not m:
+            return {"error": "no_url_found"}
+        return m[-1].group(0).rstrip(".,;)")
+    if spec.type == "csv":
+        parts = re.split(r"[\n,，、;；]+", s)
+        parts = [p.strip() for p in parts if p and p.strip()]
+        if not parts:
+            return {"error": "empty_list"}
+        seen = set(); out=[]
+        for p in parts:
+            if p not in seen:
+                seen.add(p); out.append(p)
+        return out
+    return s
+
+def normalize_by_spec(spec: AnswerSpec, value: Union[str, List[str], Dict[str, Any]]) -> Union[str, Dict[str, Any]]:
+    if isinstance(value, dict) and "error" in value:
+        return value
+    if spec.type == "date":
+        # 日期标准化：确保 YYYY-MM-DD 格式
+        s = str(value).strip()
+        import re
+        # 如果已经是标准格式，直接返回
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+            return s
+        # 尝试转换其他格式
+        date_match = re.search(r"(\d{4})[年/-](\d{1,2})[月/-](\d{1,2})[日]?", s)
+        if date_match:
+            year = date_match.group(1)
+            month = date_match.group(2).zfill(2)
+            day = date_match.group(3).zfill(2)
+            return f"{year}-{month}-{day}"
+        return s
+    if spec.type in ("integer", "float", "number"):
+        s = str(value).strip()
+        # 保留百分比符号（如果存在）
+        has_percent = '%' in s
+        if has_percent:
+            s = s.replace("%", "").strip()
+        try:
+            f = float(s)
+            if spec.type == "integer" or f.is_integer():
+                result = str(int(round(f)))
+            else:
+                result = ("%f" % f).rstrip("0").rstrip(".")
+            # 如果有百分比符号，加回去
+            if has_percent:
+                result += "%"
+            return result
+        except:
+            return {"error": "normalize_number_failed"}
+    if spec.type == "fraction":
+        return str(value)
+    if spec.type == "url":
+        s = str(value).strip()
+        # 移除尾部标点
+        s = s.rstrip(".,;)")
+        return s
+    if spec.type == "csv":
+        items = (value if isinstance(value, list) else [value])
+        items = [str(x).strip() for x in items]
+        seen=set(); dedup=[]
+        for x in items:
+            if x not in seen:
+                seen.add(x); dedup.append(x)
+        return spec.separator.join(dedup)
+    return str(value).strip()
+
 
 def compose_question(item: Dict[str, Any], input_jsonl_path: str) -> str:
     """
@@ -1655,12 +1975,12 @@ def compose_question(item: Dict[str, Any], input_jsonl_path: str) -> str:
     try:
         if not input_jsonl_path:
             # 如果没有提供路径，使用默认的 valid 目录
-            base_dir = Path("./valid").resolve()
+            base_dir = Path("./test").resolve()
         else:
             base_dir = Path(input_jsonl_path).resolve().parent   # 取出 ./valid
     except Exception as e:
-        logger.warning(f"Failed to resolve base_dir from {input_jsonl_path}: {e}, using default ./valid")
-        base_dir = Path("./valid").resolve()
+        logger.warning(f"Failed to resolve base_dir from {input_jsonl_path}: {e}, using default ./test")
+        base_dir = Path("./test").resolve()
 
     # 相对路径 -> 绝对路径
     def to_abs(p: str) -> str:
@@ -1712,11 +2032,29 @@ def load_processed(checkpoint_file):
     """增强版已处理记录加载"""
     processed = {}
     if checkpoint_file.exists():
-        with open(checkpoint_file, 'r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                unique_key = f"{row['task_id']}"
-                processed[unique_key] = row['response']
+        try:
+            # 第一轮尝试：按带表头读取
+            with open(checkpoint_file, 'r', encoding='utf-8-sig', newline='') as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames and 'task_id' in reader.fieldnames and 'response' in reader.fieldnames:
+                    for row in reader:
+                        if row.get('task_id'):
+                            processed[str(row['task_id'])] = row.get('response', '')
+                else:
+                    # 兼容无表头的历史文件：按首列=task_id，次列=response 解析
+                    f.seek(0)
+                    row_reader = csv.reader(f)
+                    for row in row_reader:
+                        if not row:
+                            continue
+                        task_id = str(row[0]).strip()
+                        if not task_id or task_id.lower() == 'task_id':
+                            # 跳过可能的表头或空值
+                            continue
+                        response = str(row[1]).strip() if len(row) > 1 else ''
+                        processed[task_id] = response
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint file {checkpoint_file}: {e}, starting fresh")
     return processed
 
 
@@ -1773,7 +2111,7 @@ async def run_batch(
 	logger.info(f"Loaded {len(processed)} already processed tasks from checkpoint.")
 
 	# 加载数据集 - 使用 input_jsonl_path 参数
-	jsonl_file_path = input_jsonl_path if input_jsonl_path else "./valid/data.jsonl"
+	jsonl_file_path = input_jsonl_path if input_jsonl_path else "./test/data.jsonl"
 	if not Path(jsonl_file_path).exists():
 		logger.error(f"Dataset file not found: {jsonl_file_path}")
 		return
@@ -1827,9 +2165,24 @@ async def run_batch(
 					resp = await mas.call(callee="master_agent", arguments={"query": question})
 					answer = resp.output if hasattr(resp, "output") else str(resp)
 					
-					# 清理答案：移除前导/尾随空白字符，并应用标准化清理
-					cleaned_answer = _clean_final_answer(answer)
-					answer = _normalize_answer(cleaned_answer)
+					# 确定性流水线：spec → extract → normalize → commit
+					spec = parse_answer_spec(question)
+					extracted = extract_deterministic(spec, answer)
+					normalized = normalize_by_spec(spec, extracted)
+					if isinstance(normalized, dict) and normalized.get("error"):
+						cleaned_answer = _clean_final_answer(answer)
+						answer = _normalize_answer(cleaned_answer, question)
+					else:
+						answer = str(normalized)
+						try:
+							from oxygent.preset_tools.python_tools import final_answer_guard as _guard
+							atype = {
+								"integer": "number", "float": "float", "fraction": "fraction",
+								"url": "string", "csv": "string", "date": "string", "text": "string"
+							}.get(spec.type, "string")
+							_ = await _guard(action="commit", answer=answer, answer_type=atype)
+						except Exception:
+							pass
 					
 					# 保存结果到 checkpoint 和 Parquet
 					save_result(item, answer, result_dir, checkpoint_file, failed_checkpoint_file, is_error=False)
@@ -1902,7 +2255,13 @@ def main():
 	parser.add_argument("--validate", action="store_true", help="Validate results against 'answer' field in input_jsonl.")
 	parser.add_argument("--enable_mcp", action="store_true", help="Enable MCP tools (requires Node.js and MCP servers).")
 	
-	args = parser.parse_args()
+	try:
+		args = parser.parse_args()
+	except SystemExit as e:
+		# 如果参数解析失败，提供更友好的错误信息
+		if e.code != 0:
+			print("\n提示：如果看到 'unrecognized arguments'，请检查命令行末尾是否有多余的空格或特殊字符。")
+		raise
 
 	Config.set_app_name(args.app_name)
 

@@ -243,3 +243,14 @@ pyproject.toml*
 cache_dir/
 local_file/
 deployment/
+
+# image
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.svg
+*.ico
