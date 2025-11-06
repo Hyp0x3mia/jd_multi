@@ -1130,6 +1130,18 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 	)
 	oxy_space.append(audio_mcp)
 
+
+	# 注册 video_mcp
+	video_mcp = oxy.StdioMCPClient(
+		name="video_tools",
+		params={
+			"command": "uv",
+			"args": ["--directory", "./mcp_servers", "run", "video/server.py"],
+		},
+	)	
+	oxy_space.append(video_mcp)
+
+
 	# 注册 Case Bank MCP
 	try:
 		case_bank_mcp = oxy.StdioMCPClient(
@@ -1155,6 +1167,8 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 		oxy_space.append(todo_mcp)
 	except Exception as e:
 		print(f"Warning: Could not add mcp-todo: {e}")
+
+
 
 	# 注册新版 GitHub 稳定 API 工具与 Guardrails/Sanity（供 web_agent 优先使用）
 	oxy_space.append(github_api_tools)
@@ -1187,8 +1201,10 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 	oxy_space = [t for t in oxy_space if t is not None]
 
 	# 任务型智能体
+
 	available_tools = {getattr(t, "name", None) for t in oxy_space if hasattr(t, "name")}
-	
+	print(available_tools)
+
 	# MathAgent：数学/逻辑计算
 	oxy_space.append(
 		oxy.ReActAgent(
@@ -1514,10 +1530,58 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 					"\n"
 					"CRITICAL: You MUST call the audio_transcribe tool when an audio file path is detected. Do not skip tool calling."
 				),
-				timeout=300,
+				timeout=600,
 			)
 		)
-	
+
+	#
+	if "video_tools" in available_tools:
+		video_tools_list = []
+		video_tools_list.append("video_tools")
+
+	oxy_space.append(
+		oxy.ReActAgent(
+			name="video_agent",
+			desc="Video Understanding Specialist – analyze video content through key-frame extraction and visual question answering.",
+			tools=video_tools_list,
+			llm_model="zai-org/GLM-4.5",
+			additional_prompt=(
+				'''
+				ROLE: Video Understanding Specialist  
+				SCOPE: Perform video analysis including: extract basic metadata (size, duration, resolution, frame-rate), sample key frames, and answer user questions grounded in those frames.  
+				LIMITATIONS:  
+				- Only processes local video files; remote URLs or streams are not supported.  
+				- Frame extraction is time-range bounded; provide start_time and end_time when a question targets a specific segment.  
+				- Answers are inference-based; state uncertainty if visual evidence is insufficient.  
+
+				POLICY:  
+				1. For metadata: Always call get_basic_video_info first to confirm video validity and gather context.  
+				2. For content questions: Invoke video_understanding with a concise vlm_prompt; supply start_time & end_time if query refers to an exact moment.  
+				3. For general video summary: Use video_understanding without vlm_prompt to obtain an auto-generated description.  
+				4. Return results verbatim from tools; prepend short context (e.g., 'Detected 120 frames, 30 s clip') but keep the main answer unaltered.  
+
+				TOOL CALL FORMAT:  
+				When you need to call the tool, respond with JSON:  
+				{"think": "<brief reason>", "tool_name": "get_basic_video_info", "arguments": {"video_path": "<absolute_path>"}}  
+				{"think": "<brief reason>", "tool_name": "video_understanding", "arguments": {"path": "<absolute_path>", "vlm_prompt": "<optional_question>", "start_time": <optional_start>, "end_time": <optional_end>}}  
+
+				EXAMPLES:  
+				- Query: 'What is the resolution and duration of /data/clips/demo.mp4?'  
+				→ {"think": "User asks for metadata of /data/clips/demo.mp4", "tool_name": "get_basic_video_info", "arguments": {"video_path": "/data/clips/demo.mp4"}}  
+
+				- Query: 'What appears in the search box between 30 s and 32 s in /tmp/clip.mp4?'  
+				→ {"think": "Specific visual question on 30-32 s slice", "tool_name": "video_understanding", "arguments": {"path": "/tmp/clip.mp4", "start_time": 30, "end_time": 32, "vlm_prompt": "What text is in the search box?"}}  
+
+				- Query: 'Summarize the whole video /media/intro.avi'  
+				→ {"think": "General summary needed", "tool_name": "video_understanding", "arguments": {"path": "/media/intro.avi"}}  
+
+				OUTPUT: Provide tool outputs directly, or concise error messages if operations fail. Include critical metadata (duration, resolution) when relevant.  
+				'''
+			),
+			timeout=600,
+		)
+	)
+
 	# Normalizer：强规范化输出
 	oxy_space.append(
 		oxy.ReActAgent(
@@ -1652,11 +1716,12 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			name="master_agent",
 			sub_agents=[
 				"router_agent", "math_agent", "time_agent", 
-				"web_agent", "audio_agent", "file_agent","directory_agent", "normalizer_agent"
+				"web_agent", "audio_agent", "file_agent","directory_agent", "normalizer_agent","video_agent"
 			],
 			tools=[
 				# guard & utils
-				"python_tools", "final_answer_guard",
+				# "python_tools", "final_answer_guard",
+				"python_tools", 
 				# case bank tools
 				"casebank_ping", "case_save", "case_search", "case_update_score", "case_get",
 				# todo tools

@@ -142,6 +142,7 @@ env/
 res/
 venv/
 ENV/
+keyframes/
 env.bak/
 venv.bak/
 
