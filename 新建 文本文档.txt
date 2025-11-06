@@ -1,5 +1,13 @@
 python examples/application/gaia_runner.py --web --first_query "测试问题"
 
+python mcp_servers/video/server.py 
+
+uv pip install opencv-python
+uv pip install scikit-image
+uv pip install pypinyin
+
+ "final_answer_guard 不存在
 
 
-python examples/application/gaia_runner.py  --input_jsonl ./valid/data.jsonl  --output ./res/results.jsonl
+
+python examples/application/gaia_runner.py  --input_jsonl ./test/data.jsonl  --output ./res/results.jsonl
