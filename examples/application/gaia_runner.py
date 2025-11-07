@@ -1159,6 +1159,16 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 	)
 	oxy_space.append(audio_mcp)
 
+	# 注册 video_mcp
+	video_mcp = oxy.StdioMCPClient(
+		name="video_tools",
+		params={
+			"command": "uv",
+			"args": ["--directory", "./mcp_servers", "run", "video/server.py"],
+		},
+	)	
+	oxy_space.append(video_mcp)
+
 	# 注册 Case Bank MCP
 	try:
 		case_bank_mcp = oxy.StdioMCPClient(
@@ -1571,6 +1581,64 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			)
 		)
 	
+	# video
+	if "video_tools" in available_tools:
+		video_tools_list = []
+		video_tools_list.append("video_tools")
+
+	oxy_space.append(
+		oxy.ReActAgent(
+			name="video_agent",
+			desc="Video Understanding Specialist – analyze video content through key-frame extraction and visual question answering.",
+			tools=video_tools_list,
+			llm_model="zai-org/GLM-4.5",
+			additional_prompt=(
+				'''
+				ROLE: Video Understanding Specialist  
+				SCOPE: Perform video analysis including: extract basic metadata (size, duration, resolution, frame-rate), sample key frames, and answer user questions grounded in those frames.  
+				LIMITATIONS:  
+				- Only processes local video files; remote URLs or streams are not supported.  
+				- Frame extraction needs a non-zero time span; single-timestamp queries must not duplicate the value.
+				- Answers are inference-based; state uncertainty if visual evidence is insufficient.  
+
+				POLICY:  
+				1. For metadata: Always call get_basic_video_info first to confirm video validity and gather context.  
+				2. For content questions: Invoke video_understanding with a concise vlm_prompt; supply start_time & end_time if query refers to an exact moment.  
+				3. For general video summary: Use video_understanding without vlm_prompt to obtain an auto-generated description.  
+				4. Return results verbatim from tools; prepend short context (e.g., 'Detected 120 frames, 30 s clip') but keep the main answer unaltered.  
+				5. Time-rule – never invent the missing bound:
+				– “At 4 s” → start_time = 4, end_time = None (function auto-ends at next key-frame or EOF).
+				– “Until 4 s” → start_time = None, end_time = 4.
+				– “From 4 s to 6 s” → start_time = 4, end_time = 6.		
+						
+				TOOL CALL FORMAT:  
+				When you need to call the tool, respond with JSON:  
+				{"think": "<brief reason>", "tool_name": "get_basic_video_info", "arguments": {"video_path": "<absolute_path>"}}  
+				{"think": "<brief reason>", "tool_name": "video_understanding", "arguments": {"path": "<absolute_path>", "vlm_prompt": "<optional_question>", "start_time": <optional_start>, "end_time": <optional_end>}}  
+
+				EXAMPLES:  
+				- Query: 'What is the resolution and duration of /data/clips/demo.mp4?'  
+				→ {"think": "User asks for metadata of /data/clips/demo.mp4", "tool_name": "get_basic_video_info", "arguments": {"video_path": "/data/clips/demo.mp4"}}  
+				
+				- Query: ' 在视频的第23秒，请问有什么出现?'  
+				→ {"think": "The user is asking about the visual content at the 23-second mark of the video.", "tool_name": "video_understanding", "arguments": {"path": "/tmp/clip.mp4", "start_time": 30, "end_time": None, "vlm_prompt": "What appears or happens at this moment?"}}  
+
+				- Query: ' Until the 46-second mark, how many people are there?'  
+				→ {"think": "The user wants a head-count for everything from the start of the video up to, but not beyond, the 46-second mark.", "tool_name": "video_understanding", "arguments": {"path": "/tmp/clip.mp4", "start_time": None, "end_time": 46, "vlm_prompt": "How many people are visible in this segment?"}}
+				
+				- Query: 'What appears in the search box between 30 s and 32 s in /tmp/clip.mp4?'  
+				→ {"think": "Specific visual question on 30-32 s slice", "tool_name": "video_understanding", "arguments": {"path": "/tmp/clip.mp4", "start_time": 30, "end_time": 32, "vlm_prompt": "What text is in the search box?"}}  
+
+				- Query: 'Summarize the whole video /media/intro.avi'  
+				→ {"think": "General summary needed", "tool_name": "video_understanding", "arguments": {"path": "/media/intro.avi"}}  
+
+				OUTPUT: Provide tool outputs directly, or concise error messages if operations fail. Include critical metadata (duration, resolution) when relevant.  
+				'''
+			),
+			timeout=600,
+		)
+	)
+
 	# Normalizer：强规范化输出
 	oxy_space.append(
 		oxy.ReActAgent(
@@ -1634,6 +1702,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- 'audio': Audio transcription (音频/语音/录音/asr/转写: wav/mp3/m4a/flac). File_Name must be an audio file.\n"
 				"- 'file': File content extraction/analysis (read pdf, extract text from images, analyze document content).\n"
 				"- 'directory': Directory Operations  – handle file/directory creation, reading, writing, deletion, info query, counting, and listing.\n"
+				"- 'video': Video Understanding Specialist – analyze video content through key-frame extraction and visual question answering.\n"
 				"  * NOT for counting files or listing directories - that's 'math'.\n"
 				"  * Use 'file' when task asks to extract/read content FROM a file (not count files).\n"
 				"\n"
@@ -1644,7 +1713,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"4) If File_Name is a single file AND task asks to extract/read content → 'file'.\n"
 				"5) Otherwise, match based on query keywords.\n"
 				"\n"
-				"OUTPUT: Return ONLY the classification token (math/time/web/audio/file).\n"
+				"OUTPUT: Return ONLY the classification token (math/time/web/audio/file/directory/video).\n"
 				"\n"
 				"You have access to these tools:\n"
 				"${tools_description}\n"
@@ -1662,7 +1731,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			name="master_agent",
 			sub_agents=[
 				"router_agent", "math_agent", "time_agent", 
-				"web_agent", "audio_agent", "file_agent","directory_agent", "normalizer_agent"
+				"web_agent", "audio_agent", "file_agent","directory_agent", "normalizer_agent", "video_agent"
 			],
 			tools=[
 				# guard & utils
