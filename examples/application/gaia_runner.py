@@ -2,6 +2,7 @@ import asyncio
 import argparse
 import json
 import os
+import re
 import unicodedata
 import time
 import requests
@@ -64,14 +65,14 @@ def _clean_final_answer(text: str) -> str:
 
 
 def _extract_final_answer(text: str, question: str = "") -> str:
-    """只提取最终答案，忽略所有附加说明。支持数字、百分比、URL、日期、CSV等类型。"""
+    """只提取最终答案，忽略所有附加说明。支持定界符、数字、百分比、URL、日期、CSV等类型。"""
     if not text:
         return ""
     
     import re
     s = str(text).strip()
     
-    # 先尝试使用确定性流水线（如果问题可用）
+    # 1. 先尝试使用确定性流水线（如果问题可用）(保留原代码)
     if question:
         try:
             spec = parse_answer_spec(question)
@@ -82,43 +83,65 @@ def _extract_final_answer(text: str, question: str = "") -> str:
                     return str(normalized)
         except Exception:
             pass
+            
+    # 2. 尝试提取定界符内的答案（结构化优先）
+    final_answer_match = re.search(r"<[aA]nswer>([\s\S]*?)</[aA]nswer>|<[Ff]inal[Aa]nswer>([\s\S]*?)</[Ff]inal[Aa]nswer>", s)
+    if final_answer_match:
+        extracted_text = final_answer_match.group(1) or final_answer_match.group(2)
+        if extracted_text and extracted_text.strip():
+            # 对提取出的内容进行最终清理和 NFKC 归一化
+            return _clean_final_answer(extracted_text)
+
+    # 3. 默认返回文本优先 (P1)
+    # 将清理后的文本作为基础，用于捕获实体/文本答案 (如 "五星低碳供应商")
+    cleaned_s = _clean_final_answer(s)
     
-    # 回退到通用模式匹配
-    # 1. 百分比数字（如 200%）
-    percent_pattern = r"(-?\d+(?:\.\d+)?%?)"
-    percent_match = re.search(r"(-?\d+(?:\.\d+)?%)", s)
+    # --- 通用模式匹配回退（仅在文本中发现更严格的格式时才覆盖 cleaned_s） ---
+    
+    extracted_candidate = None
+
+    # 3.1. 百分比数字（如 200%）(P2)
+    percent_match = re.search(r"(-?\d+(?:\.\d+)?%)", cleaned_s)
     if percent_match:
-        return percent_match.group(1).strip()
+        extracted_candidate = percent_match.group(1).strip()
     
-    # 2. URL 提取
-    url_pattern = r"https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
-    url_match = re.search(url_pattern, s)
-    if url_match:
-        return url_match.group(0).strip()
+    # 3.2. URL 提取 (P3)
+    elif re.search(r"^https?://", cleaned_s, re.IGNORECASE) or re.search(r"https?://", cleaned_s, re.IGNORECASE):
+        # 如果文本以 URL 开头，或者包含 URL，则提取
+        url_pattern = r"https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
+        url_match = re.search(url_pattern, cleaned_s)
+        if url_match:
+             extracted_candidate = url_match.group(0).strip().rstrip(".,;)")
     
-    # 3. 日期提取（处理常见格式：YYYY-MM-DD, YYYY年MM月DD日等）
-    date_pattern = r"(\d{4}[年/-]\d{1,2}[月/-]\d{1,2}[日]?)"
-    date_match = re.search(date_pattern, s)
-    if date_match:
-        date_str = date_match.group(1)
-        # 标准化日期格式：2025年12月25日 → 2025-12-25
-        date_str = re.sub(r"(\d{4})[年/-](\d{1,2})[月/-](\d{1,2})[日]?", r"\1-\2-\3", date_str)
-        return date_str.strip()
-    
-    # 4. 数字（整数、小数、负数）
-    number_pattern = r"(-?\d+(?:\.\d+)?)"
-    number_match = re.search(number_pattern, s)
-    if number_match:
-        return number_match.group(1).strip()
-    
-    # 5. CSV 类型：提取以逗号分隔的值
-    if ',' in s:
-        parts = [p.strip() for p in s.split(',') if p.strip()]
+    # 3.3. CSV 类型 (P3)
+    elif re.search(r"[,;，；\n]", cleaned_s) and len([p for p in re.split(r"[,;，；\n]", cleaned_s) if p.strip()]) > 1:
+        # 提取以通用分隔符分隔的值，仅在存在多项时考虑
+        parts = [p.strip() for p in re.split(r"[,;，；\n]", cleaned_s) if p.strip()]
         if len(parts) > 1:
-            return ','.join(parts)
+            extracted_candidate = ','.join(parts)
+
+    # 4. 泛化数字/日期提取 (P5 - P6)
     
-    # 6. 默认返回清理后的文本
-    return _clean_final_answer(s)
+    # 4.1. 数字（整数、小数、负数）(P5)
+    if extracted_candidate is None:
+        number_pattern = r"(-?\d+(?:\.\d+)?)"
+        all_numbers = list(re.finditer(number_pattern, cleaned_s))
+        # 仅在文本较短时进行数字提取，避免从长篇解释中提取数字
+        if all_numbers and len(cleaned_s) < 50:
+             extracted_candidate = all_numbers[-1].group(1).strip()
+        
+    # 4.2. 日期提取 (P6)
+    if extracted_candidate is None:
+        date_pattern = r"(\d{4}[年/-]\d{1,2}[月/-]\d{1,2}[日]?)"
+        date_match = re.search(date_pattern, cleaned_s)
+        if date_match:
+            date_str = date_match.group(1)
+            # 标准化日期格式：2025年12月25日 → 2025-12-25
+            date_str = re.sub(r"(\d{4})[年/-](\d{1,2})[月/-](\d{1,2})[日]?", r"\1-\2-\3", date_str)
+            extracted_candidate = date_str.strip()
+
+    # 5. 返回最终答案：如果提取到了更严格的类型，则返回它；否则返回最初清理的文本。
+    return extracted_candidate if extracted_candidate else cleaned_s
 
 
 def _normalize_answer(text: str, question: str = "") -> str:
@@ -128,10 +151,10 @@ def _normalize_answer(text: str, question: str = "") -> str:
     
     import re
     
-    # 先提取答案
+    # 先用提取器得到候选答案（不再在此重复提取，仅做标准化）
     cleaned_answer = _extract_final_answer(text, question)
     
-    # 对不同类型的答案进行标准化
+    # 对不同类型的答案进行标准化（仅格式修正，不做二次搜索）
     # 1. 百分比：确保格式正确（如 200%）
     if '%' in cleaned_answer:
         cleaned_answer = cleaned_answer.strip()
@@ -141,7 +164,7 @@ def _normalize_answer(text: str, question: str = "") -> str:
             cleaned_answer = re.sub(r"(\d+(?:\.\d+)?)\s*%?", r"\1%", cleaned_answer)
     
     # 2. 纯数字：移除多余空格，处理负数和小数
-    elif re.match(r"^-?\d+(\.\d+)?$", cleaned_answer):
+    elif re.match(r"^-?\d+(?:\.\d+)?$", cleaned_answer):
         cleaned_answer = cleaned_answer.strip()
         # 如果是整数但写成小数形式（如 12.0），转为整数
         try:
@@ -154,13 +177,16 @@ def _normalize_answer(text: str, question: str = "") -> str:
         except:
             pass
     
-    # 3. 日期：标准化为 YYYY-MM-DD 格式
-    if '年' in cleaned_answer or '月' in cleaned_answer or '日' in cleaned_answer:
-        # 尝试格式化日期（2025年12月25日 → 2025-12-25）
+    # 3. 日期：标准化为 YYYY-MM-DD 格式（支持 YYYY-M-D 与 含中文分隔）
+    if (
+        ('年' in cleaned_answer or '月' in cleaned_answer or '日' in cleaned_answer) or
+        re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", cleaned_answer)
+    ):
+        # 统一替换为连字符
         cleaned_answer = re.sub(r"(\d{4})[年/-](\d{1,2})[月/-](\d{1,2})[日]?", r"\1-\2-\3", cleaned_answer)
         # 确保月份和日期是两位数
         parts = cleaned_answer.split('-')
-        if len(parts) == 3:
+        if len(parts) == 3 and all(parts) and parts[0].isdigit():
             parts[1] = parts[1].zfill(2)
             parts[2] = parts[2].zfill(2)
             cleaned_answer = '-'.join(parts)
@@ -1553,28 +1579,33 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			tools=["string_tools"],
 			llm_model="zai-org/GLM-4.5",
 			prompt=(
-				"ROLE: Answer Validator (只验不改值)\n\n"
+				"ROLE: Answer Validator (只验不改值，格式标准化)\n\n"
 				"INPUT: query (contains question and candidate_answer)\n\n"
 				"MANDATE:\n"
-				"- DO NOT recalculate or invent new answers.\n"
-				"- DO NOT change the semantic meaning of candidate_answer.\n"
-				"- Only validate format and return the candidate_answer if valid, or return a simple error message.\n\n"
+				"- DO NOT recalculate or invent new answers. **DO NOT change the semantic meaning.**\n"
+				"- Only validate format and return the **PURE, extracted answer** (no surrounding text, no markdown).\n"
+				"- If valid, the output MUST be wrapped in a <FINAL_ANSWER>...</FINAL_ANSWER> tag.\n\n"
 				"PROCESS:\n"
 				"1) Extract question and candidate_answer from the query.\n"
-				"2) Check if candidate_answer matches the expected format:\n"
-				"   - For numbers: should be pure digits (with optional sign/decimal point), no extra text.\n"
-				"   - For URLs: should be valid http(s) URL.\n"
-				"   - For dates: should be in YYYY-MM-DD format.\n"
-				"   - For CSV: should be comma-separated values.\n"
-				"3) If valid, return the candidate_answer as-is (no reformatting).\n"
-				"4) If invalid, return a simple text message like 'invalid_format' (no JSON).\n\n"
+				"2) Based on the question, determine the expected answer type (Number, URL, Date, CSV, Text).\n"
+				"3) **CLEAN & EXTRACT:** Remove all extraneous surrounding text, markdown formatting (like **), and punctuation (except within URLs or numbers).\n"
+				"4) Check if the CLEANED answer matches the expected format:\n"
+				"   - For **Numbers**: Extract ONLY the pure number (e.g., '12.50'). **REMOVE all units** ($, ¥, km) UNLESS it is a percentage (%).\n"
+				"   - For **URLs**: Should be a valid http(s) URL.\n"
+				"   - For **Dates**: Standardize to strict **YYYY-MM-DD** format.\n"
+				"   - For **CSV**: Ensure values are separated by a comma (,).\n"
+				"5) If valid, return the standardized, PURE answer.\n"
+				"6) If invalid, return a simple error message **'invalid_format'**.\n\n"
 				"EXAMPLES:\n"
-				"- Input: 'Question: What is 2+2? Candidate: 4' → Output: '4'\n"
-				"- Input: 'Question: What is 2+2? Candidate: The answer is 4' → Output: '4' (extract number only)\n"
-				"- Input: 'Question: What is 2+2? Candidate: I think it's 5' → Output: 'invalid_format'\n\n"
+				"- Input: 'Q: 2+2? C: The answer is 4.' → Output: '<FINAL_ANSWER>4</FINAL_ANSWER>'\n"
+				"- Input: 'Q: Growth? C: 12% in 2024' → Output: '<FINAL_ANSWER>12%</FINAL_ANSWER>'\n"
+				"- Input: 'Q: What day? C: The date is 2025/8/11.' → Output: '<FINAL_ANSWER>2025-08-11</FINAL_ANSWER>'\n"
+				"- Input: 'Q: Items? C: 1. Apple; 2. Banana' → Output: '<FINAL_ANSWER>Apple,Banana</FINAL_ANSWER>'\n"
+				"- Input: 'Q: Color? C: The color is blue.' → Output: '<FINAL_ANSWER>blue</FINAL_ANSWER>'\n"
+				"- Input: 'Q: What day? C: I think it's 5' → Output: 'invalid_format'\n\n"
 				"OUTPUT:\n"
-				"Return ONLY the validated answer (same as candidate if valid), or 'invalid_format' if invalid. Do NOT use JSON format."
-			),
+				"Return ONLY the validated answer wrapped in <FINAL_ANSWER>...</FINAL_ANSWER> or 'invalid_format'. Do NOT use JSON format."
+				),
 			timeout=30,
 		)
 	)
@@ -1679,10 +1710,12 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"   - If file_agent returns error/empty/unable_to_process (especially for counting/statistics tasks), automatically retry with math_agent.\n"
 				"   - If any agent fails but task involves counting/statistics/calculation, use math_agent as fallback.\n"
 				"   - If web_agent returns incomplete or unclear information, you may retry with more specific query or different extraction method.\n"
-				"4) Normalize (OPTIONAL): After any specialist returns a candidate, you MAY call normalizer_agent with query containing both question and candidate_answer.\n"
-				"   - Format: 'Question: [original question] Candidate: [specialist agent output]'\n"
-				"   - If normalizer_agent returns 'invalid_format', use the candidate_answer directly.\n"
-				"   - If normalizer_agent returns a valid answer, use that as the final answer.\n"
+				"4) Normalize (CRITICAL - MANDATORY STEP): After any specialist returns a candidate answer, you MUST ALWAYS call normalizer_agent before finalizing.\n"
+				"   - This step is NOT optional. You MUST call normalizer_agent with format: 'Question: [original question] Candidate: [specialist agent output]'\n"
+				"   - normalizer_agent will clean and format the answer, returning it wrapped in <FINAL_ANSWER>...</FINAL_ANSWER> tags.\n"
+				"   - Extract the content from <FINAL_ANSWER> tags and use that as your final output.\n"
+				"   - If normalizer_agent returns 'invalid_format', you may fall back to the original candidate, but you MUST still attempt the call.\n"
+				"   - DO NOT skip this step or return the raw specialist output without normalization.\n"
 				"5) Commit Final Answer (GUARD): After normalization, call final_answer_guard('commit', answer, answer_type). If commit succeeds, proceed.\n"
 				"6) Persist Case (AFTER success): If guard commit succeeded, call case_save(...) then case_update_score(success:true, latency_ms?).\n"
 				"7) On Failure/Timeout: call case_update_score(success:false) and todo_autogen_from_case({case_id, reason, attach}).\n"
@@ -1690,10 +1723,12 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- ALWAYS check for missing information (especially time) BEFORE routing.\n"
 				"- When calling router_agent, pass the FULL query string (including any File_Name context and supplemented information).\n"
 				"- When calling audio_agent/file_agent, ALWAYS pass the FULL query string (including File_Name) so they can extract file paths.\n"
+				"- **CRITICAL**: You MUST call normalizer_agent after receiving any specialist agent's output. This is a mandatory step, not optional.\n"
+				"- **CRITICAL**: Your final output MUST be the result from normalizer_agent (extracted from <FINAL_ANSWER> tags), not the raw specialist output.\n"
 				"- Be aware that information from web sources may not always be accurate - trust but verify when possible.\n"
 				"- Keep chain-of-thought internal; do not output reasoning.\n"
 				"- No prefixes (Answer:/Result:) or extra lines.\n"
-				"- The final output must be the normalized answer string only.\n"
+				"- The final output must be the normalized answer string only (from normalizer_agent).\n"
 			),
 			timeout=180,
 		)
@@ -1715,7 +1750,9 @@ async def run_single(question: str, enable_mcp: bool = False) -> str:
 		if isinstance(normalized, dict) and normalized.get("error"):
 			# 回退到原轻量清洗，保证不崩溃
 			cleaned_answer = _clean_final_answer(answer)
-			return _normalize_answer(cleaned_answer, question)
+			candidate = _normalize_answer(cleaned_answer, question)
+		else:
+			candidate = str(normalized)
 		# 提交到最终答案守门器（一次提交，不可覆盖）
 		try:
 			from oxygent.preset_tools.python_tools import final_answer_guard as _guard
@@ -1723,10 +1760,26 @@ async def run_single(question: str, enable_mcp: bool = False) -> str:
 				"integer": "number", "float": "float", "fraction": "fraction",
 				"url": "string", "csv": "string", "date": "string", "text": "string"
 			}.get(spec.type, "string")
-			_ = await _guard(action="commit", answer=normalized, answer_type=atype)
+			_ = await _guard(action="commit", answer=candidate, answer_type=atype)
 		except Exception:
 			pass
-		return str(normalized)
+		# 强制调用 normalizer_agent 进行结构化输出（<FINAL_ANSWER> 包装）
+		try:
+			n_input = f"Question: {question}\nCandidate: {candidate}"
+			logger.info(f"Calling normalizer_agent with input: {n_input[:100]}...")
+			n_resp = await mas.call(callee="normalizer_agent", arguments={"query": n_input})
+			n_text = n_resp.output if hasattr(n_resp, "output") else str(n_resp)
+			logger.info(f"normalizer_agent returned: {n_text[:100]}...")
+			if isinstance(n_text, str) and n_text.strip() and n_text.strip() != "invalid_format":
+				# 提取 <FINAL_ANSWER> 标签内的内容，如果没有标签则使用整个文本
+				final_match = re.search(r"<[Ff]inal[Aa]nswer>([\s\S]*?)</[Ff]inal[Aa]nswer>", n_text)
+				if final_match:
+					return final_match.group(1).strip()
+				return n_text.strip()
+		except Exception as e:
+			logger.warning(f"normalizer_agent call failed: {e}")
+		# 兜底返回确定性流水线结果
+		return candidate
 
 
 # def compose_question(item: Dict[str, Any]) -> str:
@@ -2183,6 +2236,23 @@ async def run_batch(
 							_ = await _guard(action="commit", answer=answer, answer_type=atype)
 						except Exception:
 							pass
+
+					# 强制调用 normalizer_agent 进行结构化输出（<FINAL_ANSWER> 包装）
+					try:
+						n_input = f"Question: {question}\nCandidate: {answer}"
+						logger.info(f"Calling normalizer_agent with input: {n_input[:100]}...")
+						n_resp = await mas.call(callee="normalizer_agent", arguments={"query": n_input})
+						n_text = n_resp.output if hasattr(n_resp, "output") else str(n_resp)
+						logger.info(f"normalizer_agent returned: {n_text[:100]}...")
+						if isinstance(n_text, str) and n_text.strip() and n_text.strip() != "invalid_format":
+							# 提取 <FINAL_ANSWER> 标签内的内容，如果没有标签则使用整个文本
+							final_match = re.search(r"<[Ff]inal[Aa]nswer>([\s\S]*?)</[Ff]inal[Aa]nswer>", n_text)
+							if final_match:
+								answer = final_match.group(1).strip()
+							else:
+								answer = n_text.strip()
+					except Exception as e:
+						logger.warning(f"normalizer_agent call failed: {e}")
 					
 					# 保存结果到 checkpoint 和 Parquet
 					save_result(item, answer, result_dir, checkpoint_file, failed_checkpoint_file, is_error=False)
