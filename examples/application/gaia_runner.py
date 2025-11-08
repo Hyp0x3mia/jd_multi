@@ -6,13 +6,14 @@ import re
 import unicodedata
 import time
 import requests
-from typing import Any, Dict, List, Optional, Union, Literal
+from typing import Any, Dict, List, Optional, Union, Literal, Tuple
 from pathlib import Path
 
 from oxygent import MAS, Config, oxy, preset_tools
 from pydantic import Field
 import importlib.util
 import logging
+Config.set_app_name('1108_v4')
 
 logger = logging.getLogger(__name__)
 """
@@ -142,6 +143,59 @@ def _extract_final_answer(text: str, question: str = "") -> str:
 
     # 5. 返回最终答案：如果提取到了更严格的类型，则返回它；否则返回最初清理的文本。
     return extracted_candidate if extracted_candidate else cleaned_s
+
+
+def _extract_final_answer_tag(text: str) -> str:
+	"""提取 <FINAL_ANSWER> 标签内的内容，如果不存在标签则返回原文本"""
+	if not text:
+		return text
+	
+	import re
+	# 记录输入文本（用于调试）
+	input_preview = text[:100] if len(text) > 100 else text
+	logger.info(f"_extract_final_answer_tag called with input (full): {repr(text)}")
+	logger.info(f"_extract_final_answer_tag input length: {len(text)}")
+	
+	# 方法1：使用正则表达式（支持所有大小写组合和分隔符）
+	patterns = [
+		(r"<final[_\s-]?answer>([\s\S]*?)</final[_\s-]?answer>", "FINAL_ANSWER/FinalAnswer/final_answer"),
+		(r"<answer>([\s\S]*?)</answer>", "Answer/ANSWER"),
+	]
+	
+	for pattern, desc in patterns:
+		logger.debug(f"Trying pattern: {pattern} ({desc})")
+		match = re.search(pattern, text, re.IGNORECASE)
+		if match:
+			extracted = match.group(1).strip()
+			logger.info(f"✅ Extracted from tag pattern '{desc}': '{extracted[:50]}...' (original length: {len(text)}, extracted length: {len(extracted)})")
+			return extracted
+		else:
+			logger.debug(f"Pattern '{desc}' did not match")
+	
+	# 方法2：如果正则表达式失败，尝试简单的字符串查找（更健壮）
+	# 查找 <FINAL_ANSWER> 或 <FinalAnswer> 等变体（不区分大小写）
+	text_lower = text.lower()
+	start_markers = ["<final_answer>", "<finalanswer>", "<final-answer>", "<answer>"]
+	end_markers = ["</final_answer>", "</finalanswer>", "</final-answer>", "</answer>"]
+	
+	for start_marker, end_marker in zip(start_markers, end_markers):
+		start_idx = text_lower.find(start_marker)
+		if start_idx != -1:
+			# 找到开始标签，查找对应的结束标签
+			end_idx = text_lower.find(end_marker, start_idx + len(start_marker))
+			if end_idx != -1:
+				# 提取标签内的内容
+				extracted = text[start_idx + len(start_marker):end_idx].strip()
+				logger.info(f"✅ Extracted using string search '{start_marker}...{end_marker}': '{extracted[:50]}...'")
+				return extracted
+	
+	# 如果没有找到标签，检查是否包含类似标签的文本（用于调试）
+	if "<" in text and ">" in text:
+		logger.warning(f"⚠️  Text contains '<' and '>' but no matching tag pattern found. Text preview: {input_preview}...")
+	
+	# 如果没有找到标签，返回原文本
+	logger.debug(f"No tag found, returning original text (length: {len(text)})")
+	return text
 
 
 def _normalize_answer(text: str, question: str = "") -> str:
@@ -1832,21 +1886,34 @@ async def run_single(question: str, enable_mcp: bool = False) -> str:
 			_ = await _guard(action="commit", answer=candidate, answer_type=atype)
 		except Exception:
 			pass
+		
+		# 在确定性流水线后立即提取 <FINAL_ANSWER> 标签（如果存在）
+		candidate = _extract_final_answer_tag(candidate)
+		
 		# 强制调用 normalizer_agent 进行结构化输出（<FINAL_ANSWER> 包装）
 		try:
 			n_input = f"Question: {question}\nCandidate: {candidate}"
 			logger.info(f"Calling normalizer_agent with input: {n_input[:100]}...")
 			n_resp = await mas.call(callee="normalizer_agent", arguments={"query": n_input})
 			n_text = n_resp.output if hasattr(n_resp, "output") else str(n_resp)
-			logger.info(f"normalizer_agent returned: {n_text[:100]}...")
+			logger.info(f"normalizer_agent returned (full): {n_text}")
 			if isinstance(n_text, str) and n_text.strip() and n_text.strip() != "invalid_format":
 				# 提取 <FINAL_ANSWER> 标签内的内容，如果没有标签则使用整个文本
-				final_match = re.search(r"<[Ff]inal[Aa]nswer>([\s\S]*?)</[Ff]inal[Aa]nswer>", n_text)
-				if final_match:
-					return final_match.group(1).strip()
-				return n_text.strip()
+				logger.info(f"Before extraction: candidate = '{n_text[:200]}...'")
+				extracted = _extract_final_answer_tag(n_text)
+				logger.info(f"After extraction: candidate = '{extracted[:200]}...'")
+				return extracted
+			else:
+				logger.warning(f"normalizer_agent returned invalid format: {n_text}")
 		except Exception as e:
-			logger.warning(f"normalizer_agent call failed: {e}")
+			logger.warning(f"normalizer_agent call failed: {e}", exc_info=True)
+		
+		# 最终安全措施：确保提取 <FINAL_ANSWER> 标签内的内容（防止标签被返回）
+		# 无论是否经过 normalizer_agent，都尝试提取标签内容
+		logger.info(f"Final safety check: before extraction candidate = '{candidate[:200]}...'")
+		candidate = _extract_final_answer_tag(candidate)
+		logger.info(f"Final safety check: after extraction candidate = '{candidate[:200]}...'")
+		
 		# 兜底返回确定性流水线结果
 		return candidate
 
@@ -2218,10 +2285,120 @@ def save_result(question_data, response, result_dir, checkpoint_file, failed_che
                 response
             ])
 
+async def process_single_item(
+	mas: MAS,
+	item: pd.Series,
+	jsonl_file_path: str,
+	result_dir: Path,
+	checkpoint_file: Path,
+	failed_checkpoint_file: Path,
+	jsonl_file,
+	validate: bool = False
+) -> Tuple[int, int]:
+	"""处理单个任务项，返回 (correct_count, total_count)"""
+	answer = ""
+	result_record = {}
+	correct_count = 0
+	total_count = 0
+	
+	try:
+		# 使用处理后的 jsonl_file_path 而不是原始的 input_jsonl_path
+		question = compose_question(item, jsonl_file_path)
+		if not question:
+			logger.warning(f"Task {item.get('task_id', 'N/A')} has no question field, skipping.")
+			result_record = {"error": "no question field", **item.to_dict()}
+			# 立即保存到 JSONL
+			jsonl_file.write(json.dumps(result_record, ensure_ascii=False) + "\n")
+			jsonl_file.flush()
+			return (correct_count, total_count)
+		
+		# 实际调用 master_agent
+		logger.info(f"Processing task {item.get('task_id', 'N/A')}: {question[:50]}...")
+		resp = await mas.call(callee="master_agent", arguments={"query": question})
+		answer = resp.output if hasattr(resp, "output") else str(resp)
+		
+		# 确定性流水线：spec → extract → normalize → commit
+		spec = parse_answer_spec(question)
+		extracted = extract_deterministic(spec, answer)
+		normalized = normalize_by_spec(spec, extracted)
+		if isinstance(normalized, dict) and normalized.get("error"):
+			cleaned_answer = _clean_final_answer(answer)
+			answer = _normalize_answer(cleaned_answer, question)
+		else:
+			answer = str(normalized)
+			try:
+				from oxygent.preset_tools.python_tools import final_answer_guard as _guard
+				atype = {
+					"integer": "number", "float": "float", "fraction": "fraction",
+					"url": "string", "csv": "string", "date": "string", "text": "string"
+				}.get(spec.type, "string")
+				_ = await _guard(action="commit", answer=answer, answer_type=atype)
+			except Exception:
+				pass
+		
+		# 在确定性流水线后立即提取 <FINAL_ANSWER> 标签（如果存在）
+		answer = _extract_final_answer_tag(answer)
+
+		# 强制调用 normalizer_agent 进行结构化输出（<FINAL_ANSWER> 包装）
+		try:
+			n_input = f"Question: {question}\nCandidate: {answer}"
+			logger.info(f"Calling normalizer_agent with input: {n_input[:100]}...")
+			n_resp = await mas.call(callee="normalizer_agent", arguments={"query": n_input})
+			n_text = n_resp.output if hasattr(n_resp, "output") else str(n_resp)
+			logger.info(f"normalizer_agent returned (full): {n_text}")
+			if isinstance(n_text, str) and n_text.strip() and n_text.strip() != "invalid_format":
+				# 提取 <FINAL_ANSWER> 标签内的内容，如果没有标签则使用整个文本
+				logger.info(f"Before extraction: answer = '{n_text[:200]}...'")
+				answer = _extract_final_answer_tag(n_text)
+				logger.info(f"After extraction: answer = '{answer[:200]}...'")
+			else:
+				logger.warning(f"normalizer_agent returned invalid format: {n_text}")
+		except Exception as e:
+			logger.warning(f"normalizer_agent call failed: {e}", exc_info=True)
+		
+		# 最终安全措施：确保提取 <FINAL_ANSWER> 标签内的内容（防止标签被保存）
+		# 无论是否经过 normalizer_agent，都尝试提取标签内容
+		logger.info(f"Final safety check: before extraction answer = '{answer[:200]}...'")
+		answer = _extract_final_answer_tag(answer)
+		logger.info(f"Final safety check: after extraction answer = '{answer[:200]}...'")
+		
+		# 保存结果到 checkpoint 和 Parquet
+		save_result(item, answer, result_dir, checkpoint_file, failed_checkpoint_file, is_error=False)
+		
+		# 构建结果记录
+		result_record = {"task_id": item.get('task_id'), "question": question, "answer": answer}
+		
+		# 立即保存到 JSONL 文件
+		jsonl_file.write(json.dumps(result_record, ensure_ascii=False) + "\n")
+		jsonl_file.flush()
+		
+		# 验证（如果启用）
+		if validate and "answer" in item:
+			total_count += 1
+			expected_answer = item["answer"]
+			if answer == expected_answer:
+				correct_count += 1
+			else:
+				logger.info(f"Task ID: {item.get('task_id', 'N/A')}")
+				logger.info(f"  Expected: {expected_answer}")
+				logger.info(f"  Got:      {answer}")
+		
+	except Exception as e:
+		logger.error(f"Error processing task {item.get('task_id', 'N/A')}: {e}", exc_info=True)
+		save_result(item, str(e), result_dir, checkpoint_file, failed_checkpoint_file, is_error=True)
+		result_record = {"task_id": item.get('task_id'), "error": str(e)}
+		
+		# 立即保存错误结果到 JSONL 文件
+		jsonl_file.write(json.dumps(result_record, ensure_ascii=False) + "\n")
+		jsonl_file.flush()
+	
+	return (correct_count, total_count)
+
+
 async def run_batch(
-	input_jsonl_path: str, output_jsonl_path: str, enable_mcp: bool = False, validate: bool = False
+	input_jsonl_path: str, output_jsonl_path: str, enable_mcp: bool = False, validate: bool = False, batch_size: int = 10
 ) -> None:
-	"""批量处理任务，支持断点续传"""
+	"""批量处理任务，支持断点续传，每处理 batch_size 条数据后重启进程"""
 	result_dir = Path("./res/")
 	checkpoint_file = result_dir / "processed.csv"
 	failed_checkpoint_file = result_dir / "failed_processed.csv"
@@ -2256,7 +2433,7 @@ async def run_batch(
 		return
 	
 	datasets_df = pd.DataFrame(datasets)
-	logger.info(f"To process: {len(datasets)} tasks.")
+	logger.info(f"To process: {len(datasets)} tasks. Batch size: {batch_size}")
 
 	correct_count = 0
 	total_count = 0
@@ -2266,92 +2443,32 @@ async def run_batch(
 	jsonl_file = open(output_jsonl_path, "a", encoding="utf-8")
 	
 	try:
-		oxy_space = build_oxy_space(enable_mcp=enable_mcp)
-		async with MAS(oxy_space=oxy_space) as mas:
-			for idx, item in datasets_df.iterrows():
-				answer = ""
-				result_record = {}
-				try:
-					# 使用处理后的 jsonl_file_path 而不是原始的 input_jsonl_path
-					question = compose_question(item, jsonl_file_path)
-					if not question:
-						logger.warning(f"Task {item.get('task_id', 'N/A')} has no question field, skipping.")
-						result_record = {"error": "no question field", **item.to_dict()}
-						# 立即保存到 JSONL
-						jsonl_file.write(json.dumps(result_record, ensure_ascii=False) + "\n")
-						jsonl_file.flush()
-						continue
-					
-					# 实际调用 master_agent
-					logger.info(f"Processing task {item.get('task_id', 'N/A')}: {question[:50]}...")
-					resp = await mas.call(callee="master_agent", arguments={"query": question})
-					answer = resp.output if hasattr(resp, "output") else str(resp)
-					
-					# 确定性流水线：spec → extract → normalize → commit
-					spec = parse_answer_spec(question)
-					extracted = extract_deterministic(spec, answer)
-					normalized = normalize_by_spec(spec, extracted)
-					if isinstance(normalized, dict) and normalized.get("error"):
-						cleaned_answer = _clean_final_answer(answer)
-						answer = _normalize_answer(cleaned_answer, question)
-					else:
-						answer = str(normalized)
-						try:
-							from oxygent.preset_tools.python_tools import final_answer_guard as _guard
-							atype = {
-								"integer": "number", "float": "float", "fraction": "fraction",
-								"url": "string", "csv": "string", "date": "string", "text": "string"
-							}.get(spec.type, "string")
-							_ = await _guard(action="commit", answer=answer, answer_type=atype)
-						except Exception:
-							pass
-
-					# 强制调用 normalizer_agent 进行结构化输出（<FINAL_ANSWER> 包装）
-					try:
-						n_input = f"Question: {question}\nCandidate: {answer}"
-						logger.info(f"Calling normalizer_agent with input: {n_input[:100]}...")
-						n_resp = await mas.call(callee="normalizer_agent", arguments={"query": n_input})
-						n_text = n_resp.output if hasattr(n_resp, "output") else str(n_resp)
-						logger.info(f"normalizer_agent returned: {n_text[:100]}...")
-						if isinstance(n_text, str) and n_text.strip() and n_text.strip() != "invalid_format":
-							# 提取 <FINAL_ANSWER> 标签内的内容，如果没有标签则使用整个文本
-							final_match = re.search(r"<[Ff]inal[Aa]nswer>([\s\S]*?)</[Ff]inal[Aa]nswer>", n_text)
-							if final_match:
-								answer = final_match.group(1).strip()
-							else:
-								answer = n_text.strip()
-					except Exception as e:
-						logger.warning(f"normalizer_agent call failed: {e}")
-					
-					# 保存结果到 checkpoint 和 Parquet
-					save_result(item, answer, result_dir, checkpoint_file, failed_checkpoint_file, is_error=False)
-					
-					# 构建结果记录
-					result_record = {"task_id": item.get('task_id'), "question": question, "answer": answer}
-					
-					# 立即保存到 JSONL 文件
-					jsonl_file.write(json.dumps(result_record, ensure_ascii=False) + "\n")
-					jsonl_file.flush()
-					
-					# 验证（如果启用）
-					if validate and "answer" in item:
-						total_count += 1
-						expected_answer = item["answer"]
-						if answer == expected_answer:
-							correct_count += 1
-						else:
-							logger.info(f"Task ID: {item.get('task_id', 'N/A')}")
-							logger.info(f"  Expected: {expected_answer}")
-							logger.info(f"  Got:      {answer}")
-					
-				except Exception as e:
-					logger.error(f"Error processing task {item.get('task_id', 'N/A')}: {e}", exc_info=True)
-					save_result(item, str(e), result_dir, checkpoint_file, failed_checkpoint_file, is_error=True)
-					result_record = {"task_id": item.get('task_id'), "error": str(e)}
-					
-					# 立即保存错误结果到 JSONL 文件
-					jsonl_file.write(json.dumps(result_record, ensure_ascii=False) + "\n")
-					jsonl_file.flush()
+		# 将数据集分成批次处理
+		total_batches = (len(datasets_df) + batch_size - 1) // batch_size
+		
+		for batch_idx in range(total_batches):
+			start_idx = batch_idx * batch_size
+			end_idx = min((batch_idx + 1) * batch_size, len(datasets_df))
+			batch_df = datasets_df.iloc[start_idx:end_idx]
+			
+			logger.info(f"Processing batch {batch_idx + 1}/{total_batches} (tasks {start_idx + 1}-{end_idx})")
+			
+			# 为每个批次创建新的 MAS 实例
+			oxy_space = build_oxy_space(enable_mcp=enable_mcp)
+			async with MAS(oxy_space=oxy_space) as mas:
+				for idx, item in batch_df.iterrows():
+					item_correct, item_total = await process_single_item(
+						mas, item, jsonl_file_path, result_dir, checkpoint_file, 
+						failed_checkpoint_file, jsonl_file, validate
+					)
+					correct_count += item_correct
+					total_count += item_total
+			
+			# 批次处理完成，MAS 实例会自动关闭
+			logger.info(f"Batch {batch_idx + 1}/{total_batches} completed. Process will restart for next batch.")
+			# 给系统一点时间释放资源
+			await asyncio.sleep(1)
+			
 	finally:
 		jsonl_file.close()
 
@@ -2393,6 +2510,7 @@ def main():
 	parser.add_argument("--app_name", type=str, default="app", help="Set application name for experiment isolation.")
 	parser.add_argument("--validate", action="store_true", help="Validate results against 'answer' field in input_jsonl.")
 	parser.add_argument("--enable_mcp", action="store_true", help="Enable MCP tools (requires Node.js and MCP servers).")
+	parser.add_argument("--batch_size", type=int, default=10, help="Number of tasks to process before restarting the process (default: 10).")
 	
 	try:
 		args = parser.parse_args()
@@ -2408,7 +2526,7 @@ def main():
 		answer = asyncio.run(run_single(args.question, enable_mcp=args.enable_mcp))
 		print(f"Answer: {answer}")
 	elif args.input_jsonl:
-		asyncio.run(run_batch(args.input_jsonl, args.output, args.enable_mcp, args.validate))
+		asyncio.run(run_batch(args.input_jsonl, args.output, args.enable_mcp, args.validate, args.batch_size))
 	elif args.web:
 		asyncio.run(start_web(args.first_query, enable_mcp=args.enable_mcp))
 	else:

@@ -1,149 +1,36 @@
 {
-    "default": {
-        "app": {
-            "name": "app",
-            "version": "1.0.0"
-        },
-        "log": {
-            "path": "./cache_dir/app.log",
-            "level_root": "INFO",
-            "level_terminal": "INFO",
-            "level_file": "INFO",
-            "color_is_on_background": false,
-            "is_bright": false,
-            "only_message_color": true,
-            "color_tool_call": "YELLOW",
-            "color_observation": "CYAN",
-            "is_detailed_tool_call": true,
-            "is_detailed_observation": true
-        },
-        "llm": {    
-            "cls": "oxygent.llms.OllamaLLM",
-            "base_url": "http://localhost:11434",
-            "temperature": 0.1, 
-            "max_tokens": 4096, 
-            "top_p": 1
-        },
-        "cache": {
-            "save_dir": "./cache_dir"
-        },
-        "message": {
-            "is_send_tool_call": true,
-            "is_send_observation": true,
-            "is_send_think": true,
-            "is_send_answer": true,
-            "is_stored": false,
-            "is_show_in_terminal": false,
-            "is_send_full_arguments": false
-        },
-        "vearch": {},
-        "es": {},
-        "es_schema": {
-            "shared_data": {"type": "text"},
-            "group_data": {"type": "text"}
-        },
-        "es_settings": {
-            "number_of_shards": 1,
-            "number_of_replicas": 1
-        },
-        "redis": {},
-        "redis_param": {
-            "expire_time": 86400,
-            "max_size": 1024,
-            "max_length": 20480
-        },
-        "server": {
-            "host": "127.0.0.1",
-            "port": 8080,
-            "auto_open_webpage": true,
-            "log_level": "INFO"
-        },
-        "agent": {
-            "prompt": "",
-            "llm_model": "default_llm",
-            "input_schema": {
-                "properties": {"query": {"description": "Query question"}},
-                "required": ["query"]
-            }
-        },
-        "tool": {
-            "mcp_is_keep_alive": true, 
-            "is_concurrent_init": true
-        }
-    },
-    "dev": {
-        "app": {
-            "name": "app-dev"
-        },
-        "es": {
-            "hosts": [
-                "${TEST_ES_HOST_1}",
-                "${TEST_ES_HOST_2}", 
-                "${TEST_ES_HOST_3}"
-            ],
-            "user": "${TEST_ES_USER}",
-            "password": "${TEST_ES_PASSWORD}"
-        }
-    },
-    "test": {
-        "es": {
-            "hosts": [
-                "${TEST_ES_HOST_1}",
-                "${TEST_ES_HOST_2}", 
-                "${TEST_ES_HOST_3}"
-            ],
-            "user": "${TEST_ES_USER}",
-            "password": "${TEST_ES_PASSWORD}"
-        },
-        "vearch": {
-            "router_url": "${VEARCH_ROUTER_URL}",
-            "master_url": "${VEARCH_MASTER_URL}",
-            "db_name": "${VEARCH_DB_NAME}",
-            "tool_space_name": "${VEARCH_TOOL_SPACE_NAME}",
-            "embedding_model_url": "${EMBEDDING_MODEL_URL}"
-        },
-        "redis": {
-            "host": "${TEST_REDIS_HOST}",
-            "port": 5360,
-            "password": "${TEST_REDIS_PASSWORD}",
-            "db": 0
-        }
-    },
-    "prod": {
-        "message": {
-            "is_send_tool_call": false,
-            "is_send_observation": false
-        },
-        "log": {
-            "path": "/export/Logs/server_logger.log",
-            "color_is_on_background": true,
-            "is_bright": true
-        },
-        "server": {
-            "host": "0.0.0.0",
-            "auto_open_webpage": false
-        },
-        "es": {
-            "hosts": [
-                "${PROD_ES_HOST_1}", 
-                "${PROD_ES_HOST_2}", 
-                "${PROD_ES_HOST_3}"
-            ],
-            "user": "${PROD_ES_USER}",
-            "password": "${PROD_ES_PASSWORD}"
-        },
-        "vearch": {
-            "router_url": "${VEARCH_ROUTER_URL}",
-            "master_url": "${VEARCH_MASTER_URL}",
-            "db_name": "${VEARCH_DB_NAME}",
-            "tool_space_name": "${VEARCH_TOOL_SPACE_NAME}",
-            "embedding_model_url": "${EMBEDDING_MODEL_URL}"
-        },
-        "redis": {
-            "host": "${PROD_REDIS_HOST}",
-            "port": 5360,
-            "password": "${PROD_REDIS_PASSWORD}",
-            "db": 0
-        }
-    }
+  "architectures": [
+    "TimesFmModelForPrediction"
+  ],
+  "attention_dropout": 0.0,
+  "context_length": 2048,
+  "freq_size": 3,
+  "head_dim": 80,
+  "hidden_size": 1280,
+  "horizon_length": 128,
+  "initializer_range": 0.02,
+  "intermediate_size": 1280,
+  "max_timescale": 10000,
+  "min_timescale": 1,
+  "model_type": "timesfm",
+  "num_attention_heads": 16,
+  "num_hidden_layers": 50,
+  "pad_val": 1123581321.0,
+  "patch_length": 32,
+  "quantiles": [
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9
+  ],
+  "rms_norm_eps": 1e-06,
+  "tolerance": 1e-06,
+  "torch_dtype": "float32",
+  "transformers_version": "4.52.0.dev0",
+  "use_positional_embedding": false
 }
