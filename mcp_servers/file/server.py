@@ -49,7 +49,7 @@ _VL_URL = os.getenv("VL_URL")
 _VL_KEY = os.getenv("VL_KEY")
 _VL_MODEL = os.getenv("VL_MODEL")
 _DOC_MAX_WIDTH = int(os.getenv("DOC_MAX_WIDTH", "1600"))
-_PDF_RENDER_DPI = int(os.getenv("PDF_RENDER_DPI", "220"))
+_PDF_RENDER_DPI = int(os.getenv("PDF_RENDER_DPI", "300"))
 _MAX_CHARS_PER_CALL = int(os.getenv("MAX_CHARS_PER_CALL", "7000"))  # 文本分片上限，控制单次 tokens
 
 if not _VL_URL or not _VL_KEY or not _VL_MODEL:
@@ -87,9 +87,8 @@ def _call_vlm(messages: List[dict], max_retries: int = 4, base_sleep: float = 0.
             resp = client.chat.completions.create(
                 model=model_name,
                 messages=messages,
-                temperature=0,
+                temperature=0.1,
                 top_p=0.8,
-                max_tokens=512,
                 stream=False,
                 timeout=timeout,
             )

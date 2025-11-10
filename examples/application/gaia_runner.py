@@ -13,7 +13,7 @@ from oxygent import MAS, Config, oxy, preset_tools
 from pydantic import Field
 import importlib.util
 import logging
-Config.set_app_name('1108_v4')
+Config.set_app_name('1108_v5')
 
 logger = logging.getLogger(__name__)
 """
@@ -1404,7 +1404,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"  1) Navigate/open the candidate page (if already on page, skip search).\n"
 				"  2) Take a screenshot (full_page=true when content may be below the fold).\n"
 				"  3) Call browser_analyze_screenshot with a precise prompt to OCR the target field only.\n"
-				"  4) Use regex-like extraction guidance in the prompt, e.g., 提取“总第…号/第…号/证书编号/No.”等字样后的编号，输出数字或编号本体。\n"
+				"  4) Use regex-like extraction guidance in the prompt, e.g., 提取\"总第…号/第…号/证书编号/No.\"等字样后的编号，输出数字或编号本体。\n"
 				"- After a successful visual hit, STOP all searches and finalize.\n"
 				"POLICY:\n"
 				"- Keep steps minimal: search → analyze results → extract → STOP.\n"
@@ -1661,9 +1661,9 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				3. For general video summary: Use video_understanding without vlm_prompt to obtain an auto-generated description.  
 				4. Return results verbatim from tools; prepend short context (e.g., 'Detected 120 frames, 30 s clip') but keep the main answer unaltered.  
 				5. Time-rule – never invent the missing bound:
-				– “At 4 s” → start_time = 4, end_time = None (function auto-ends at next key-frame or EOF).
-				– “Until 4 s” → start_time = None, end_time = 4.
-				– “From 4 s to 6 s” → start_time = 4, end_time = 6.		
+				– "At 4 s" → start_time = 4, end_time = None (function auto-ends at next key-frame or EOF).
+				– "Until 4 s" → start_time = None, end_time = 4.
+				– "From 4 s to 6 s" → start_time = 4, end_time = 6.		
 						
 				TOOL CALL FORMAT:  
 				When you need to call the tool, respond with JSON:  
@@ -1722,7 +1722,13 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- Input: 'Q: 2+2? C: The answer is 4.' → Output: '<FINAL_ANSWER>4</FINAL_ANSWER>'\n"
 				"- Input: 'Q: Growth? C: 12% in 2024' → Output: '<FINAL_ANSWER>12%</FINAL_ANSWER>'\n"
 				"- Input: 'Q: What day? C: The date is 2025/8/11.' → Output: '<FINAL_ANSWER>2025-08-11</FINAL_ANSWER>'\n"
+				"- Input: 'Q: 发布日期？ C: 发布于2025年8月3日。' → Output: '<FINAL_ANSWER>2025-08-03</FINAL_ANSWER>'\n"
+				"- Input: 'Q: Price? C: ￥199.00 (limited offer)' → Output: '<FINAL_ANSWER>199.00</FINAL_ANSWER>'\n"
 				"- Input: 'Q: Items? C: 1. Apple; 2. Banana' → Output: '<FINAL_ANSWER>Apple,Banana</FINAL_ANSWER>'\n"
+				"- Input: 'Q: 合作伙伴？ C: 阿里巴巴、京东、腾讯。' → Output: '<FINAL_ANSWER>阿里巴巴,京东,腾讯</FINAL_ANSWER>'\n"
+				"- Input: 'Q: 官方公告链接? C: 请访问 https://example.com/info 。' → Output: '<FINAL_ANSWER>https://example.com/info</FINAL_ANSWER>'\n"
+				"- Input: 'Q: 官方邮箱？ C: 联系 support@example.com 获取帮助。' → Output: '<FINAL_ANSWER>support@example.com</FINAL_ANSWER>'\n"
+				"- Input: 'Q: 占比？ C: 约等于 23.5%。' → Output: '<FINAL_ANSWER>23.5%</FINAL_ANSWER>'\n"
 				"- Input: 'Q: Color? C: The color is blue.' → Output: '<FINAL_ANSWER>blue</FINAL_ANSWER>'\n"
 				"- Input: 'Q: What day? C: I think it's 5' → Output: 'invalid_format'\n\n"
 				"OUTPUT:\n"
@@ -1861,61 +1867,18 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 
 
 async def run_single(question: str, enable_mcp: bool = False) -> str:
-	"""运行单个问题"""
+	"""运行单个问题（简化版，类似 web 模式）"""
 	oxy_space = build_oxy_space(enable_mcp=enable_mcp)
 	async with MAS(oxy_space=oxy_space) as mas:
-		resp = await mas.call(callee="master_agent", arguments={"query": question})
+		# 禁用历史记录访问，避免干扰模型判断（批量处理中每个任务都是独立的）
+		resp = await mas.call(callee="master_agent", arguments={
+			"query": question,
+			"short_memory": [],
+			"master_short_memory": []
+		})
 		answer = resp.output if hasattr(resp, "output") else str(resp)
-		# 确定性流水线：spec → extract → normalize → commit
-		spec = parse_answer_spec(question)
-		extracted = extract_deterministic(spec, answer)
-		normalized = normalize_by_spec(spec, extracted)
-		if isinstance(normalized, dict) and normalized.get("error"):
-			# 回退到原轻量清洗，保证不崩溃
-			cleaned_answer = _clean_final_answer(answer)
-			candidate = _normalize_answer(cleaned_answer, question)
-		else:
-			candidate = str(normalized)
-		# 提交到最终答案守门器（一次提交，不可覆盖）
-		try:
-			from oxygent.preset_tools.python_tools import final_answer_guard as _guard
-			atype = {
-				"integer": "number", "float": "float", "fraction": "fraction",
-				"url": "string", "csv": "string", "date": "string", "text": "string"
-			}.get(spec.type, "string")
-			_ = await _guard(action="commit", answer=candidate, answer_type=atype)
-		except Exception:
-			pass
-		
-		# 在确定性流水线后立即提取 <FINAL_ANSWER> 标签（如果存在）
-		candidate = _extract_final_answer_tag(candidate)
-		
-		# 强制调用 normalizer_agent 进行结构化输出（<FINAL_ANSWER> 包装）
-		try:
-			n_input = f"Question: {question}\nCandidate: {candidate}"
-			logger.info(f"Calling normalizer_agent with input: {n_input[:100]}...")
-			n_resp = await mas.call(callee="normalizer_agent", arguments={"query": n_input})
-			n_text = n_resp.output if hasattr(n_resp, "output") else str(n_resp)
-			logger.info(f"normalizer_agent returned (full): {n_text}")
-			if isinstance(n_text, str) and n_text.strip() and n_text.strip() != "invalid_format":
-				# 提取 <FINAL_ANSWER> 标签内的内容，如果没有标签则使用整个文本
-				logger.info(f"Before extraction: candidate = '{n_text[:200]}...'")
-				extracted = _extract_final_answer_tag(n_text)
-				logger.info(f"After extraction: candidate = '{extracted[:200]}...'")
-				return extracted
-			else:
-				logger.warning(f"normalizer_agent returned invalid format: {n_text}")
-		except Exception as e:
-			logger.warning(f"normalizer_agent call failed: {e}", exc_info=True)
-		
-		# 最终安全措施：确保提取 <FINAL_ANSWER> 标签内的内容（防止标签被返回）
-		# 无论是否经过 normalizer_agent，都尝试提取标签内容
-		logger.info(f"Final safety check: before extraction candidate = '{candidate[:200]}...'")
-		candidate = _extract_final_answer_tag(candidate)
-		logger.info(f"Final safety check: after extraction candidate = '{candidate[:200]}...'")
-		
-		# 兜底返回确定性流水线结果
-		return candidate
+		# 只做基本清理（类似 web 模式）
+		return _clean_final_answer(answer)
 
 
 # def compose_question(item: Dict[str, Any]) -> str:
@@ -2312,55 +2275,17 @@ async def process_single_item(
 			jsonl_file.flush()
 			return (correct_count, total_count)
 		
-		# 实际调用 master_agent
+		# 实际调用 master_agent（简化版，类似 web 模式）
 		logger.info(f"Processing task {item.get('task_id', 'N/A')}: {question[:50]}...")
-		resp = await mas.call(callee="master_agent", arguments={"query": question})
+		# 禁用历史记录访问，避免干扰模型判断（批量处理中每个任务都是独立的）
+		resp = await mas.call(callee="master_agent", arguments={
+			"query": question,
+			"short_memory": [],
+			"master_short_memory": []
+		})
 		answer = resp.output if hasattr(resp, "output") else str(resp)
-		
-		# 确定性流水线：spec → extract → normalize → commit
-		spec = parse_answer_spec(question)
-		extracted = extract_deterministic(spec, answer)
-		normalized = normalize_by_spec(spec, extracted)
-		if isinstance(normalized, dict) and normalized.get("error"):
-			cleaned_answer = _clean_final_answer(answer)
-			answer = _normalize_answer(cleaned_answer, question)
-		else:
-			answer = str(normalized)
-			try:
-				from oxygent.preset_tools.python_tools import final_answer_guard as _guard
-				atype = {
-					"integer": "number", "float": "float", "fraction": "fraction",
-					"url": "string", "csv": "string", "date": "string", "text": "string"
-				}.get(spec.type, "string")
-				_ = await _guard(action="commit", answer=answer, answer_type=atype)
-			except Exception:
-				pass
-		
-		# 在确定性流水线后立即提取 <FINAL_ANSWER> 标签（如果存在）
-		answer = _extract_final_answer_tag(answer)
-
-		# 强制调用 normalizer_agent 进行结构化输出（<FINAL_ANSWER> 包装）
-		try:
-			n_input = f"Question: {question}\nCandidate: {answer}"
-			logger.info(f"Calling normalizer_agent with input: {n_input[:100]}...")
-			n_resp = await mas.call(callee="normalizer_agent", arguments={"query": n_input})
-			n_text = n_resp.output if hasattr(n_resp, "output") else str(n_resp)
-			logger.info(f"normalizer_agent returned (full): {n_text}")
-			if isinstance(n_text, str) and n_text.strip() and n_text.strip() != "invalid_format":
-				# 提取 <FINAL_ANSWER> 标签内的内容，如果没有标签则使用整个文本
-				logger.info(f"Before extraction: answer = '{n_text[:200]}...'")
-				answer = _extract_final_answer_tag(n_text)
-				logger.info(f"After extraction: answer = '{answer[:200]}...'")
-			else:
-				logger.warning(f"normalizer_agent returned invalid format: {n_text}")
-		except Exception as e:
-			logger.warning(f"normalizer_agent call failed: {e}", exc_info=True)
-		
-		# 最终安全措施：确保提取 <FINAL_ANSWER> 标签内的内容（防止标签被保存）
-		# 无论是否经过 normalizer_agent，都尝试提取标签内容
-		logger.info(f"Final safety check: before extraction answer = '{answer[:200]}...'")
-		answer = _extract_final_answer_tag(answer)
-		logger.info(f"Final safety check: after extraction answer = '{answer[:200]}...'")
+		# 只做基本清理（类似 web 模式）
+		answer = _clean_final_answer(answer)
 		
 		# 保存结果到 checkpoint 和 Parquet
 		save_result(item, answer, result_dir, checkpoint_file, failed_checkpoint_file, is_error=False)
