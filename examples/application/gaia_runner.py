@@ -1801,6 +1801,8 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- Input: 'Q: 官方邮箱？ C: 联系 support@example.com 获取帮助。' → Output: '<FINAL_ANSWER>support@example.com</FINAL_ANSWER>'\n"
 				"- Input: 'Q: 占比？ C: 约等于 23.5%。' → Output: '<FINAL_ANSWER>23.5%</FINAL_ANSWER>'\n"
 				"- Input: 'Q: Color? C: The color is blue.' → Output: '<FINAL_ANSWER>blue</FINAL_ANSWER>'\n"
+				"- Input: 'Q: How much do the apple and banana weigh in the basket? C: There are no apples or bananas in the basket.' → Output: '<FINAL_ANSWER>0</FINAL_ANSWER>'\n"
+				"- Input: 'Q: What is the first book in this picture? C: the first book is《活着》.' → Output: '<FINAL_ANSWER>活着</FINAL_ANSWER>'\n"
 				"- Input: 'Q: What day? C: I think it's 5' → Output: 'invalid_format'\n\n"
 				"OUTPUT:\n"
 				"Return ONLY the validated answer wrapped in <FINAL_ANSWER>...</FINAL_ANSWER> or 'invalid_format'. Do NOT use JSON format."
