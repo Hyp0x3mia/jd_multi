@@ -1,5 +1,0 @@
-python examples/application/gaia_runner.py --web --first_query "测试问题"
-
-
-
-python examples/application/gaia_runner.py  --input_jsonl ./valid/data.jsonl  --output ./res/results.jsonl

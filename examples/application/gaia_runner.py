@@ -13,7 +13,7 @@ from oxygent import MAS, Config, oxy, preset_tools
 from pydantic import Field
 import importlib.util
 import logging
-Config.set_app_name('1108_v5')
+
 
 logger = logging.getLogger(__name__)
 """
@@ -1486,8 +1486,18 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"  * Question: 'List names, comma-separated' → Output: 'Name1,Name2,Name3'\n"
 				"  * Question: '六个板块叫什么？请仅用英文逗号间隔输出' → Output: '京东金条,白条,京东小金库,基金,保险,更多服务'\n"
 				"- Return ONLY the requested fact/value in the requested format; no extra commentary, no descriptions.\n"
+				"- If the task mentions specific 京东业务线，可直接访问对应站点：\n"
+				"  • 京东物流：https://www.jdl.com/\n"
+				"  • 京东零售：https://jdx.com/home\n"
+				"  • 京东科技：https://www.jdt.com.cn/\n"
+				"  • 京东商城帮助中心：https://help.jd.com/index.html\n"
+				"  • 京东产发：https://jdp.com.cn/\n"
+				"  • 京东官网大事记：https://about.jd.com/memorabilia/\n"
+				"  • 京东全球购：https://jdw-rule.jd.hk/\n"
+				"  • 京东公益：https://gongyi.jd.com/itemslist\n"
+				"- When searching GitHub issues (e.g., 'issue #12345', 'GitHub issue'), ALWAYS use github_api_tools FIRST if available.\n"
 			),
-				timeout=300,
+				timeout=600,
 		)
 	)
 
@@ -1564,72 +1574,111 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				desc="Audio Processing Agent – ASR transcription and song recognition via audio fingerprint.",
 				tools=["audio_tools"],
 				llm_model="default_llm",
-				prompt=(
-					"ROLE: Audio Processing Specialist\n"
-					"\n"
-					"Your job is to process audio files using TWO tools: audio transcription (ASR) and song recognition (audio fingerprint).\n"
-					"\n"
-					"TOOLS AVAILABLE:\n"
-					"1) audio_transcribe: Transcribe audio to text (lyrics/speech) using ASR\n"
-					"   - Parameter: path (full file path)\n"
-					"   - Returns: transcribed text or error\n"
-					"   - Best for: lyrics, speech, or any audio with text content\n"
-					"\n"
-					"2) audio_recognize_song: Identify song by audio fingerprint (Chromaprint + AcoustID)\n"
-					"   - Parameter: path (full file path)\n"
-					"   - Returns: song title, artist, or error\n"
-					"   - Best for: music files (especially instrumental/pure music without clear lyrics)\n"
-					"\n"
-					"FILE PATH EXTRACTION:\n"
-					"The query may contain file path information in one of these formats:\n"
-					"1) Explicit file path in the query text (e.g., '/path/to/audio.wav')\n"
-					"2) File_Name field: The query may include a line like 'File_Name: /path/to/file.wav'\n"
-					"3) Extract the FIRST audio file path you find (if multiple, use the first one).\n"
-					"\n"
-					"PROCESSING STRATEGY (FLEXIBLE - USE BOTH TOOLS):\n"
-					"1) Extract the audio file path from the query.\n"
-					"2) Try audio_transcribe FIRST to get lyrics/transcription:\n"
-					"   - If successful and returns meaningful text (lyrics/speech), return that.\n"
-					"   - If returns error or empty/unclear text, proceed to step 3.\n"
-					"3) If transcription fails or query asks for song information, try audio_recognize_song:\n"
-					"   - If successful, return song title and artist.\n"
-					"   - If fails, return error message.\n"
-					"\n"
-					"DECISION LOGIC:\n"
-					"- If query asks for '歌词/lyrics/transcription/text content' → prioritize audio_transcribe\n"
-					"- If query asks for '歌曲名/song name/artist/歌手' → try audio_recognize_song first, fallback to audio_transcribe\n"
-					"- If query is general ('识别/identify/这是什么/what is this') → try both tools, use whichever succeeds\n"
-					"- If one tool succeeds, you can return that result immediately (no need to call the other)\n"
-					"- If both tools are needed for complete answer, call both and combine results\n"
-					"\n"
-					"TOOL CALL FORMAT:\n"
-					"When calling tools, respond with JSON:\n"
-					'{"think": "Extracted path: /path/to/audio.mp3. Trying audio_transcribe first...", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/audio.mp3"}}\n'
-					'Or: {"think": "Transcription failed, trying song recognition...", "tool_name": "audio_recognize_song", "arguments": {"path": "/path/to/audio.mp3"}}\n'
-					"\n"
-					"RESPONSE HANDLING:\n"
-					"- audio_transcribe response:\n"
-					"  * If contains 'text' field with meaningful content → Return '【音频转写】' + text\n"
-					"  * If contains 'error' → Try audio_recognize_song as fallback\n"
-					"- audio_recognize_song response:\n"
-					"  * If contains 'title' and 'artist' → Return '【音频识别】歌曲: {title}, 艺术家: {artist}'\n"
-					"  * If contains 'error' → Return error message\n"
-					"\n"
-					"EXAMPLES:\n"
-					"- Query: '识别这首歌的名字' → Try audio_recognize_song first\n"
-					"- Query: '转写这段音频的歌词' → Try audio_transcribe first\n"
-					"- Query: '这是什么歌曲？File_Name: /path/to/song.mp3' → Try audio_recognize_song, fallback to audio_transcribe if needed\n"
-					"\n"
-					"OUTPUT FORMAT:\n"
-					"- If transcription succeeds: Return '【音频转写】' + transcribed text\n"
-					"- If song recognition succeeds: Return '【音频识别】歌曲: {title}, 艺术家: {artist}'\n"
-					"- If both succeed: You can combine both results\n"
-					"- If both fail: Return error message\n"
-					"\n"
-					"You have access to these tools:\n"
-					"${tools_description}\n"
-					"\n"
-					"CRITICAL: Use BOTH tools flexibly. If one fails, try the other. If one succeeds, you can return that result."
+				additional_prompt=(
+				'''
+					ROLE: Audio Processing Specialist
+
+					Your job is to process audio files using TWO tools: audio transcription (ASR) and song recognition (audio fingerprint).
+
+					TOOLS AVAILABLE:
+					1) audio_transcribe: Transcribe audio to text (lyrics/speech) using ASR
+					- Parameter: path (full file path)
+					- Returns: transcribed text or error
+					- Best for: lyrics, speech, or any audio with text content
+
+					2) audio_recognize_song: Identify song by audio fingerprint (Chromaprint + AcoustID)
+					- Parameter: path (full file path)
+					- Returns: song title, artist, or error
+					- Best for: music files (especially instrumental/pure music without clear lyrics)
+
+					3) audio_file_info: one-line extraction of essential audio metadata
+						Parameter: path (absolute file path; spaces and quotes allowed)
+						Returns: file size (MB), duration (s), bit-rate (kbps), sample-rate (Hz), channel count
+
+					FILE PATH EXTRACTION:
+					The query may contain file path information in one of these formats:
+					1) Explicit file path in the query text (e.g., '/path/to/audio.wav')
+					2) File_Name field: The query may include a line like 'File_Name: /path/to/file.wav'
+					3) Extract the FIRST audio file path you find (if multiple, use the first one).
+
+					PROCESSING STRATEGY (FLEXIBLE - USE BOTH TOOLS):
+					1) Extract the audio file path from the query.
+					2) Try audio_transcribe FIRST to get lyrics/transcription:
+					- If successful and returns meaningful text (lyrics/speech), return that.
+					- If returns Returns empty string, pure music → MAYBE pure music; Not considered a failure; immediately switch to running audio_recognize_song.
+					3) If transcription fails or query asks for song information, try audio_recognize_song:
+					- If successful, return song title and artist.
+					- If fails, return error message.
+					4) Instrumental tracks with no lyrics ≠ failure. In such cases, directly output the audio recognition result—no error message.
+					5) The uploaded file's name may not match its actual content; always base your analysis solely on what the file truly contains.
+						Example: if the filename is “春天.mp4” but the song is actually “夏天.mp4”, rely on the detected content, not the name.4					6) Auto-correct obvious filename typos, e.g. change “(a,MP4)” to “a.MP4”.
+
+
+					DECISION LOGIC:
+					- If query asks for '歌词/lyrics/transcription/text content' → prioritize audio_transcribe
+					- If query asks for '歌曲名/song name/artist/歌手' → try audio_recognize_song first, fallback to audio_transcribe
+					- If query is general ('识别/identify/这是什么/what is this') → try both tools, use whichever succeeds
+					- If one tool succeeds, you can return that result immediately (no need to call the other)
+					- If both tools are needed for complete answer, call both and combine results
+
+					TOOL CALL FORMAT:
+					When calling tools, respond with JSON:
+					{"think": "Extracted path: /path/to/audio.mp3. Trying audio_transcribe first...", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/audio.mp3"}}
+					Or: {"think": "Transcription failed, trying song recognition...", "tool_name": "audio_recognize_song", "arguments": {"path": "/path/to/audio.mp3"}}
+
+					RESPONSE HANDLING:
+					- audio_recognize_song response:
+					* If contains 'title' and 'artist' → Return '【音频识别】歌曲: {title}, 艺术家: {artist}'
+					* If contains 'error' → Return error message
+
+					- audio_transcribe response:
+					* If contains 'text' field with meaningful content → Return '【音频转写】' + text
+					* If contains 'ASR未检测到任何文本' → Try audio_recognize_song as fallback, return 字数 0
+
+
+					EXAMPLES:
+					- Query: '识别这首歌的名字' → Try audio_recognize_song first
+					- Query: '转写这段音频的歌词' → Try audio_transcribe first if
+					- Query: '这是什么歌曲？File_Name: /path/to/song.mp3' → Try audio_recognize_song, fallback to audio_transcribe if needed
+					- Query: '输出这首歌英文与中文的分别数量' → Try audio_transcribe first if
+					→ {"think": "识别中文音频转写", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/song.mp3", "vlm_prompt": "识别歌曲中文文字"}} 
+						observation{ 
+							"status": "success",
+							"analysis": "xxx"} 
+					→ {"think": "已经识别中文数量,识别英文", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/song.mp3"，"vlm_prompt": "识别歌曲英文文文字"}}  
+						observation{ 
+							"status": "success",
+							"analysis": "xxxX"}
+					→ {"think": "统计两者分别数量,给出最终答案", "tool_name": "", "arguments": {}}
+					→ return "中文的数量为3,英文的数量为4"
+
+
+					- Query: 'Output the sum counts of English and Chinese in this song'
+					→ {"think": "音频转写", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/song.mp3", "vlm_prompt": "识别歌曲中文字"}} 
+						observation{
+						"status": "success",
+						"analysis": "ASR未检测到任何文本,可能文件是纯音乐，请使用audio_recognize_song工具识别音乐名后交叉确认"}
+					→ {"think": "识别是否是纯音乐", "tool_name": "audio_recognize_song", "arguments": {"path": "/path/to/song.mp3"}} 
+						observation{ 
+							"status": "success",
+							"analysis": "月光奏鸣曲"}
+					→ {"think": "absolute music,No lyrics detected, so answer is 0", "tool_name": "", "arguments": {}}
+					→ return "ASR未检测到任何文本,因为文件是纯音乐,因此answer是0"
+
+
+					OUTPUT FORMAT:
+					- If transcription succeeds: Return text directly.
+					- If song recognition succeeds: Return recognition result directly.
+					- If transcription Returns empty string → MAYBE pure music; Not considered a failure Return 0
+					- If song recognition failed: Return "音频识别错误"
+					OUTPUT: Return only the minimal text/value(s) required by the question, OR the UNABLE_TO_PROCESS message if task is outside scope
+
+
+					You have access to these tools:
+					${tools_description}
+
+					CRITICAL: Use BOTH tools flexibly. If one fails, try the other. If one succeeds, you can return that result.
+				'''
 				),
 				timeout=600,
 			)
@@ -1684,7 +1733,29 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				→ {"think": "Specific visual question on 30-32 s slice", "tool_name": "video_understanding", "arguments": {"path": "/tmp/clip.mp4", "start_time": 30, "end_time": 32, "vlm_prompt": "What text is in the search box?"}}  
 
 				- Query: 'Summarize the whole video /media/intro.avi'  
-				→ {"think": "General summary needed", "tool_name": "video_understanding", "arguments": {"path": "/media/intro.avi"}}  
+								→ {"think": "General summary needed", "tool_name": "video_understanding", "arguments": {"path": "/media/intro.avi", "vlm_prompt": "summarize this video"}}  
+
+								
+				- Query: '对比三个产品，选择同一产地的商品价最低的，返回他在首页的价格'  
+				→ {"think": "对比三个产品a,b,c，分析同一产地中价格最低的", "tool_name": "video_understanding", "arguments": {"path": "/media/intro.avi", "vlm_prompt": "找到三个产品a,b,c,分析三个产品分别产地与价格，找到同一产地的产品，返回该部分产品价格最低的产品名称、价格等各信息"}} 
+					observation{ 
+						"status": "success",
+						"analysis": "a,b同一产地，c为另一产地。且a产品价格低于b"} 
+				→ {"think": "查找在首页的价格，请注意首页可能有很多相同品牌的产品，一定要找到该产品a返回价格，", "tool_name": "video_understanding", "arguments": {"path": "/media/intro.avi"，"vlm_prompt": "查找首页所有商品信息，仔细对比与返回产品信息是否一致，并找到价格"}}  
+					observation{ 
+						"status": "success",
+						"analysis": "首页有两个产品为a同品牌，结合具体页面以及首页价格分析可知产品a价格为100元"}
+
+				- Query: "请对比视频中第一次和第二次出现的商品价格，如果第一次高输出视频的时间长度，单位为秒，如果第二次高输出视频时间长度一半"
+				→ {"think": "需要先拿到第一次出现价格的商品价格与第二次出现商品的价格", "tool_name": "video_understanding", "arguments": {"path": "/media/intro.avi","vlm_prompt": "读出画面中最明显的商品标价（数字即可）"}} 
+					observation{ 
+						"status": "success",
+						"analysis": "第一次¥99,第二次¥109"} 
+				→ {"think": "第一次¥99 < 第二次¥109，第二次更高，应输出视频总时长的一半", "tool_name": "get_basic_video_info", "arguments": {"path": "/media/intro.avi"}}  
+					observation{ 
+						"status": "success",
+						"analysis": "30s"}
+
 
 				OUTPUT: Provide tool outputs directly, or concise error messages if operations fail. Include critical metadata (duration, resolution) when relevant.  
 				'''
@@ -2358,7 +2429,7 @@ async def run_batch(
 		return
 	
 	datasets_df = pd.DataFrame(datasets)
-	logger.info(f"To process: {len(datasets)} tasks. Batch size: {batch_size}")
+	logger.info(f"To process: {len(datasets)} tasks. MAS will restart after each task (batch_size={batch_size} ignored).")
 
 	correct_count = 0
 	total_count = 0
@@ -2368,32 +2439,23 @@ async def run_batch(
 	jsonl_file = open(output_jsonl_path, "a", encoding="utf-8")
 	
 	try:
-		# 将数据集分成批次处理
-		total_batches = (len(datasets_df) + batch_size - 1) // batch_size
-		
-		for batch_idx in range(total_batches):
-			start_idx = batch_idx * batch_size
-			end_idx = min((batch_idx + 1) * batch_size, len(datasets_df))
-			batch_df = datasets_df.iloc[start_idx:end_idx]
-			
-			logger.info(f"Processing batch {batch_idx + 1}/{total_batches} (tasks {start_idx + 1}-{end_idx})")
-			
-			# 为每个批次创建新的 MAS 实例
+		total_items = len(datasets_df)
+		for position, (idx, item) in enumerate(datasets_df.iterrows(), start=1):
+			logger.info(
+				f"Processing item {position}/{total_items} (task {item.get('task_id', 'N/A')}) — restarting MAS"
+			)
 			oxy_space = build_oxy_space(enable_mcp=enable_mcp)
 			async with MAS(oxy_space=oxy_space) as mas:
-				for idx, item in batch_df.iterrows():
-					item_correct, item_total = await process_single_item(
-						mas, item, jsonl_file_path, result_dir, checkpoint_file, 
-						failed_checkpoint_file, jsonl_file, validate
-					)
-					correct_count += item_correct
-					total_count += item_total
-			
-			# 批次处理完成，MAS 实例会自动关闭
-			logger.info(f"Batch {batch_idx + 1}/{total_batches} completed. Process will restart for next batch.")
-			# 给系统一点时间释放资源
+				item_correct, item_total = await process_single_item(
+					mas, item, jsonl_file_path, result_dir, checkpoint_file,
+					failed_checkpoint_file, jsonl_file, validate
+				)
+				correct_count += item_correct
+				total_count += item_total
+			logger.info(
+				f"Item {position}/{total_items} completed. MAS instance closed; preparing next item."
+			)
 			await asyncio.sleep(1)
-			
 	finally:
 		jsonl_file.close()
 
@@ -2425,7 +2487,7 @@ def main():
 		format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 		datefmt='%Y-%m-%d %H:%M:%S'
 	)
-	
+	Config.set_app_name('1110_v6')
 	parser = argparse.ArgumentParser(description="OxyGent GAIA Runner (Simplified)")
 	parser.add_argument("--question", type=str, help="Run a single question.")
 	parser.add_argument("--input_jsonl", type=str, help="Path to input JSONL file for batch processing.")
@@ -2435,7 +2497,7 @@ def main():
 	parser.add_argument("--app_name", type=str, default="app", help="Set application name for experiment isolation.")
 	parser.add_argument("--validate", action="store_true", help="Validate results against 'answer' field in input_jsonl.")
 	parser.add_argument("--enable_mcp", action="store_true", help="Enable MCP tools (requires Node.js and MCP servers).")
-	parser.add_argument("--batch_size", type=int, default=10, help="Number of tasks to process before restarting the process (default: 10).")
+	parser.add_argument("--batch_size", type=int, default=1, help="Number of tasks to process before restarting the process (default: 10).")
 	
 	try:
 		args = parser.parse_args()
