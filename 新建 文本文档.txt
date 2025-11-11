@@ -1,5 +1,10 @@
 python examples/application/gaia_runner.py --web --first_query "测试问题"
 
 
+python mcp_servers/video/server.py
+python mcp_servers/audio/server.py
 
-python examples/application/gaia_runner.py  --input_jsonl ./valid/data.jsonl  --output ./res/results.jsonl
+python examples/application/gaia_runner.py  --input_jsonl ./test/data.jsonl  --output ./res/results.jsonl
+
+
+python examples/application/gaia_runner.py  --input_jsonl ./test/data_video.jsonl  --output ./res/results.jsonl

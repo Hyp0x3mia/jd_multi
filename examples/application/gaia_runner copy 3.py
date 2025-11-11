@@ -1600,9 +1600,6 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 					- If successful, return song title and artist.
 					- If fails, return error message.
 					4) Instrumental tracks with no lyrics ≠ failure. In such cases, directly output the audio recognition result—no error message.
-					5) The uploaded file's name may not match its actual content; always base your analysis solely on what the file truly contains.
-						Example: if the filename is “春天.mp4” but the song is actually “夏天.mp4”, rely on the detected content, not the name.4					6) Auto-correct obvious filename typos, e.g. change “(a,MP4)” to “a.MP4”.
-
 
 					DECISION LOGIC:
 					- If query asks for '歌词/lyrics/transcription/text content' → prioritize audio_transcribe
@@ -1617,52 +1614,25 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 					Or: {"think": "Transcription failed, trying song recognition...", "tool_name": "audio_recognize_song", "arguments": {"path": "/path/to/audio.mp3"}}
 
 					RESPONSE HANDLING:
+					- audio_transcribe response:
+					* If contains 'text' field with meaningful content → Return '【音频转写】' + text
+					* If contains 'error' → Try audio_recognize_song as fallback
 					- audio_recognize_song response:
 					* If contains 'title' and 'artist' → Return '【音频识别】歌曲: {title}, 艺术家: {artist}'
 					* If contains 'error' → Return error message
-
-					- audio_transcribe response:
-					* If contains 'text' field with meaningful content → Return '【音频转写】' + text
-					* If contains 'ASR未检测到任何文本' → Try audio_recognize_song as fallback, return 字数 0
-
 
 					EXAMPLES:
 					- Query: '识别这首歌的名字' → Try audio_recognize_song first
 					- Query: '转写这段音频的歌词' → Try audio_transcribe first if
 					- Query: '这是什么歌曲？File_Name: /path/to/song.mp3' → Try audio_recognize_song, fallback to audio_transcribe if needed
-					- Query: '输出这首歌英文与中文的分别数量' → Try audio_transcribe first if
-					→ {"think": "识别中文音频转写", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/song.mp3", "vlm_prompt": "识别歌曲中文文字"}} 
-						observation{ 
-							"status": "success",
-							"analysis": "xxx"} 
-					→ {"think": "已经识别中文数量,识别英文", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/song.mp3"，"vlm_prompt": "识别歌曲英文文文字"}}  
-						observation{ 
-							"status": "success",
-							"analysis": "xxxX"}
-					→ {"think": "统计两者分别数量,给出最终答案", "tool_name": "", "arguments": {}}
-					→ return "中文的数量为3,英文的数量为4"
-
-
-					- Query: 'Output the sum counts of English and Chinese in this song'
-					→ {"think": "音频转写", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/song.mp3", "vlm_prompt": "识别歌曲中文字"}} 
-						observation{
-						"status": "success",
-						"analysis": "ASR未检测到任何文本,可能文件是纯音乐，请使用audio_recognize_song工具识别音乐名后交叉确认"}
-					→ {"think": "识别是否是纯音乐", "tool_name": "audio_recognize_song", "arguments": {"path": "/path/to/song.mp3"}} 
-						observation{ 
-							"status": "success",
-							"analysis": "月光奏鸣曲"}
-					→ {"think": "absolute music,No lyrics detected, so answer is 0", "tool_name": "", "arguments": {}}
-					→ return "ASR未检测到任何文本,因为文件是纯音乐,因此answer是0"
-
 
 					OUTPUT FORMAT:
-					- If transcription succeeds: Return text directly.
-					- If song recognition succeeds: Return recognition result directly.
-					- If transcription Returns empty string → MAYBE pure music; Not considered a failure Return 0
+					- If transcription succeeds: Return "【音频转写】以下为音频识别文本：text"
+					- If song recognition succeeds: Return "【音频识别】以下为音频的相关信息：information"
+					- If transcription Returns empty string → MAYBE pure music; Not considered a failure Return "识别字数为0, 可能音频为纯音乐"
 					- If song recognition failed: Return "音频识别错误"
-					OUTPUT: Return only the minimal text/value(s) required by the question, OR the UNABLE_TO_PROCESS message if task is outside scope
 
+					OUTPUT: Provide tool outputs directly, or concise error messages if operations fail. Include critical metadata (duration, resolution) when relevant.  
 
 					You have access to these tools:
 					${tools_description}
@@ -1684,7 +1654,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			name="video_agent",
 			desc="Video Understanding Specialist – analyze video content through key-frame extraction and visual question answering.",
 			tools=video_tools_list,
-			llm_model="default_llm",
+			llm_model="zai-org/GLM-4.5",
 			additional_prompt=(
 				'''
 				ROLE: Video Understanding Specialist  
@@ -1760,7 +1730,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			name="normalizer_agent",
 			desc="Answer Validator – validate and optionally normalize answer format (no recalculation).",
 			tools=["string_tools"],
-			llm_model="default_llm",
+			llm_model="zai-org/GLM-4.5",
 			prompt=(
 				"ROLE: Answer Validator (只验不改值，格式标准化)\n\n"
 				"INPUT: query (contains question and candidate_answer)\n\n"
@@ -1771,7 +1741,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"PROCESS:\n"
 				"1) Extract question and candidate_answer from the query.\n"
 				"2) Based on the question, determine the expected answer type (Number, URL, Date, CSV, Text).\n"
-				"3) **CLEAN & EXTRACT:** Remove all extraneous surrounding text, markdown formatting (like **,《》), and punctuation (like except within URLs or numbers).\n"
+				"3) **CLEAN & EXTRACT:** Remove all extraneous surrounding text, markdown formatting (like **), and punctuation (except within URLs or numbers).\n"
 				"4) Check if the CLEANED answer matches the expected format:\n"
 				"   - For **Numbers**: Extract ONLY the pure number (e.g., '12.50'). **REMOVE all units** ($, ¥, km) UNLESS it is a percentage (%).\n"
 				"   - For **URLs**: Should be a valid http(s) URL.\n"
@@ -1785,8 +1755,6 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- Input: 'Q: What day? C: The date is 2025/8/11.' → Output: '<FINAL_ANSWER>2025-08-11</FINAL_ANSWER>'\n"
 				"- Input: 'Q: Items? C: 1. Apple; 2. Banana' → Output: '<FINAL_ANSWER>Apple,Banana</FINAL_ANSWER>'\n"
 				"- Input: 'Q: Color? C: The color is blue.' → Output: '<FINAL_ANSWER>blue</FINAL_ANSWER>'\n"
-				"- Input: 'Q: How much do the apple and banana weigh in the basket? C: There are no apples or bananas in the basket.' → Output: '<FINAL_ANSWER>0</FINAL_ANSWER>'\n"
-				"- Input: 'Q: What is the first book in this picture? C: the first book is《活着》.' → Output: '<FINAL_ANSWER>活着</FINAL_ANSWER>'\n"
 				"- Input: 'Q: What day? C: I think it's 5' → Output: 'invalid_format'\n\n"
 				"OUTPUT:\n"
 				"Return ONLY the validated answer wrapped in <FINAL_ANSWER>...</FINAL_ANSWER> or 'invalid_format'. Do NOT use JSON format."
@@ -1801,7 +1769,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			name="router_agent",
 			desc="Router – classify tasks and delegate to specialists.",
 			tools=["string_tools"],
-			llm_model="default_llm",
+			llm_model="zai-org/GLM-4.5",
 			prompt=(
 				"ROLE: Task Router\n"
 				"\n"

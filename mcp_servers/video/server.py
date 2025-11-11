@@ -30,7 +30,7 @@ base_url = os.getenv("VL_URL")
 model =os.getenv("VL_MODEL")
 print(api_key)
 client = OpenAI(api_key=api_key, base_url=base_url)
-SSIM_TH = 0.5
+SSIM_TH = 0.9
 
 from pydantic import Field
 
@@ -69,8 +69,13 @@ def save_keyframe_images_simple(
     filename_prefix: str = "frame"
 ) -> None:
     """
-    简化版：先清空输出目录，再用索引命名保存关键帧图片
+    简化版：先清空输出目录，用_extract_frames中的时间戳命名保存关键帧图片
     """
+    import os
+    import shutil
+    import cv2
+    import numpy as np
+    
     # 1. 如果目录已存在，整个删掉
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
@@ -86,16 +91,30 @@ def save_keyframe_images_simple(
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
             if img is not None:
-                filename = f"{filename_prefix}_{i:05d}.{image_format}"
+                # 使用_extract_frames中记录的timestamp
+                timestamp = frame_info["timestamp"]
+                
+                # 将秒转换为时分秒格式
+                hours = int(timestamp // 3600)
+                minutes = int((timestamp % 3600) // 60)
+                seconds = int(timestamp % 60)
+                milliseconds = int((timestamp - int(timestamp)) * 1000)
+                
+                # 创建文件名
+                if hours > 0:
+                    # 如果视频超过1小时，包含小时信息
+                    filename = f"{filename_prefix}_{hours:02d}h{minutes:02d}m{seconds:02d}s{milliseconds:03d}ms.{image_format}"
+                else:
+                    # 如果视频在1小时内，只显示分钟和秒
+                    filename = f"{filename_prefix}_{minutes:02d}m{seconds:02d}s{milliseconds:03d}ms.{image_format}"
+                
                 filepath = os.path.join(output_dir, filename)
 
                 print(filepath)
-                # 转换为字符串并保存
                 success = cv2.imwrite(str(filepath), img)
-                # success = cv2.imwrite(filepath, img)
                 if success:
                     saved_count += 1
-                    print(f"保存: {filename} (时间戳: {frame_info['timestamp']:.3f}s)")
+                    # print(f"保存: {filename} (时间戳: {timestamp:.3f}s)")
                 else:
                     print(f"保存失败: {filename}")
             else:
@@ -194,22 +213,168 @@ def save_keyframe_images_simple(
 #     return keyframes
 
 
-
+def calculate_ssim(frame1, frame2):
+        """计算两帧之间的SSIM相似度"""
+        # 调整帧大小为统一尺寸以提高计算效率
+        size = (256, 256)
+        frame1_resized = cv2.resize(frame1, size)
+        frame2_resized = cv2.resize(frame2, size)
+        
+        # 转换为灰度图
+        gray1 = cv2.cvtColor(frame1_resized, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(frame2_resized, cv2.COLOR_BGR2GRAY)
+        
+        # 计算SSIM
+        score, _ = ssim(gray1, gray2, full=True)
+        return score
 
 
 ####111
+# def extract_keyframes_with_ssim(
+#     video_path: str,
+#     start_time: Optional[float] = None,
+#     end_time: Optional[float] = None,
+#     file_name: str= None,
+#     fps: float = 2.0,
+#     ssim_th: float = SSIM_TH,
+#     stable_delay: int = 4,
+#     target_frame_count: Tuple[int, int] = (12, 25),  # 目标帧数范围
+#     max_iterations: int = 10  # 最大迭代次数，防止无限循环
+# ) -> List[Dict[str, Any]]:
+        
+#     def _extract_frames():
+#         """提取视频帧（不带阈值筛选）"""
+#         cap = cv2.VideoCapture(video_path)
+#         if not cap.isOpened():
+#             raise ValueError("无法打开视频文件")
+
+#         total_fps = cap.get(cv2.CAP_PROP_FPS)
+#         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+#         duration = total_frames / total_fps
+
+#         start = start_time if isinstance(start_time, (int, float)) else 0
+#         end = end_time if isinstance(end_time, (int, float)) else duration
+#         frame_interval = max(1, int(total_fps / fps))
+        
+#         frames: List[Dict[str, Any]] = []
+        
+#         while True:
+#             ret, frame = cap.read()
+#             if not ret:
+#                 break
+                
+#             frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+#             timestamp = frame_idx / total_fps
+            
+#             if timestamp < start:
+#                 continue
+#             if timestamp > end:
+#                 break
+
+#             if frame_idx % frame_interval == 0:
+#                 _, buffer = cv2.imencode(".jpg", frame)
+#                 image_b64 = base64.b64encode(buffer).decode("utf-8")
+#                 frames.append({
+#                     "timestamp": timestamp,
+#                     "image_b64": image_b64,
+#                     "frame": frame  # 保留原始帧数据用于后续处理
+#                 })
+        
+#         cap.release()
+#         return frames
+#     def filter_frames_by_ssim(frames, threshold):
+#         """根据SSIM阈值筛选关键帧，保留场景变化后的稳定帧"""
+#         if not frames:
+#             return []
+        
+#         keyframes = [frames[0]]  # 总是保留第一帧
+        
+#         for i in range(1, len(frames)):
+#             prev_frame = keyframes[-1]["frame"]
+#             curr_frame = frames[i]["frame"]
+            
+#             # 计算与上一关键帧的相似度
+#             similarity = calculate_ssim(prev_frame, curr_frame)
+            
+#             # 如果相似度低于阈值，说明场景变化，保留变化后的帧（考虑稳定延迟）
+#             if similarity < threshold:
+#                 # 确保不会超出frames范围
+#                 stable_index = min(i + stable_delay, len(frames) - 1)
+#                 stable_frame = frames[stable_index]
+                
+#                 # 检查是否已经包含了这个稳定帧
+#                 if stable_frame not in keyframes:
+#                     keyframes.append(stable_frame)
+        
+#         return keyframes
+#     min_target, max_target = target_frame_count
+#     current_threshold = ssim_th
+#     iteration = 0
+#     frames = _extract_frames()
+#     save_keyframe_images_simple(frames,output_dir=f".\keyframes\{file_name}_all")
+#     print(f"帧数量: {len(frames)}")
+
+#     best_keyframes = []
+#     while iteration < max_iterations:
+#         print(f"\n迭代 {iteration + 1}, 使用SSIM阈值: {current_threshold:.3f}")
+#         keyframes = filter_frames_by_ssim(frames, current_threshold)
+#         keyframe_count = len(keyframes)
+        
+#         print(f"筛选后关键帧数量: {keyframe_count}")
+
+        
+#         # 检查是否在目标范围内
+#         if min_target <= keyframe_count <= max_target:
+#             print(f"达到目标帧数范围: {keyframe_count}")
+#             best_keyframes = keyframes
+#             break
+#         elif keyframe_count < min_target:
+#             # 帧数太少，降低阈值（更宽松）
+#             current_threshold *= 1.1
+#             print(f"帧数过少 ({keyframe_count} < {min_target})，降低阈值至: {current_threshold:.3f}")
+#         else:
+#             # 帧数太多，提高阈值（更严格）
+#             current_threshold *= 0.8 
+#             print(f"帧数过多 ({keyframe_count} > {max_target})，提高阈值至: {current_threshold:.3f}")
+        
+#         # 防止阈值超出合理范围
+#         current_threshold = max(0.1, min(0.95, current_threshold))
+#         iteration += 1
+    
+#     # 如果迭代结束仍未达到目标，使用最后一次的结果
+#     if not best_keyframes and keyframes:
+#         print(f"达到最大迭代次数，使用当前结果: {len(keyframes)} 帧")
+#         best_keyframes = keyframes
+    
+#     # 保存最终关键帧
+#     if best_keyframes:
+#         save_keyframe_images_simple(best_keyframes, output_dir=f"./keyframes/{file_name}")
+    
+
+    
+#     return best_keyframes
+
+####111
+import os
+import cv2
+import base64
+import re
+from typing import List, Dict, Any, Optional, Tuple
+
 def extract_keyframes_with_ssim(
     video_path: str,
     start_time: Optional[float] = None,
     end_time: Optional[float] = None,
-    fps: float = 1.0,
+    file_name: str = None,
+    fps: float = 2.0,
     ssim_th: float = SSIM_TH,
-    stable_delay: int = 5,
-    target_frame_count: Tuple[int, int] = (12, 20)  # 目标帧数范围
+    stable_delay: int = 2,
+    target_frame_count: Tuple[int, int] = (15, 25),
+    max_iterations: int = 25
 ) -> List[Dict[str, Any]]:
     
-    def _extract_frames(current_threshold):
-        """内部函数：使用指定阈值提取关键帧"""
+    def _extract_frames():
+        """提取视频帧（不带阈值筛选）"""
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError("无法打开视频文件")
@@ -221,10 +386,8 @@ def extract_keyframes_with_ssim(
         start = start_time if isinstance(start_time, (int, float)) else 0
         end = end_time if isinstance(end_time, (int, float)) else duration
         frame_interval = max(1, int(total_fps / fps))
-        keyframes: List[Dict[str, Any]] = []
-        last_frame = None
-        change_detected = False
-        stable_counter = 0
+        
+        frames: List[Dict[str, Any]] = []
         
         while True:
             ret, frame = cap.read()
@@ -240,158 +403,165 @@ def extract_keyframes_with_ssim(
                 break
 
             if frame_idx % frame_interval == 0:
-                # 第一帧直接保留
-                if last_frame is None:
+                _, buffer = cv2.imencode(".jpg", frame)
+                image_b64 = base64.b64encode(buffer).decode("utf-8")
+                frames.append({
+                    "timestamp": timestamp,
+                    "image_b64": image_b64,
+                    "frame": frame  # 保留原始帧数据用于后续处理
+                })
+        
+        cap.release()
+        return frames
+
+    def filter_frames_by_ssim(frames, threshold):
+        """根据SSIM阈值筛选关键帧，保留场景变化后的稳定帧"""
+        if not frames:
+            return []
+        
+        keyframes = [frames[0],frames[-1]]  # 总是保留第一帧
+        
+        for i in range(1, len(frames)):
+            prev_frame = keyframes[-1]["frame"]
+            curr_frame = frames[i]["frame"]
+            
+            # 计算与上一关键帧的相似度
+            similarity = calculate_ssim(prev_frame, curr_frame)
+            
+            # 如果相似度低于阈值，说明场景变化，保留变化后的帧（考虑稳定延迟）
+            if similarity < threshold:
+                # 确保不会超出frames范围
+                stable_index = min(i + stable_delay, len(frames) - 1)
+                stable_frame = frames[stable_index]
+                
+                # 检查是否已经包含了这个稳定帧
+                if stable_frame not in keyframes:
+                    keyframes.append(stable_frame)
+        
+        return keyframes
+
+    def parse_timestamp_from_filename(filename: str) -> float:
+        """从文件名解析时间戳"""
+        # 匹配格式：00m28s000ms, 01m30s500ms 等
+        match = re.search(r'(\d+)m(\d+)s(\d+)ms', filename)
+        if match:
+            minutes = int(match.group(1))
+            seconds = int(match.group(2))
+            milliseconds = int(match.group(3))
+            return minutes * 60 + seconds + milliseconds / 1000.0
+        
+        # 尝试其他可能的格式
+        # 格式：128.5 (纯数字)
+        match_float = re.search(r'(\d+\.\d+)', filename)
+        if match_float:
+            return float(match_float.group(1))
+        
+        # 格式：128 (整数)
+        match_int = re.search(r'(\d+)', filename)
+        if match_int:
+            return float(match_int.group(1))
+            
+        raise ValueError(f"无法从文件名解析时间戳: {filename}")
+
+    def load_cached_keyframes(output_dir: str) -> List[Dict[str, Any]]:
+        """从已保存的图片加载关键帧数据"""
+        if not os.path.exists(output_dir):
+            return None
+            
+        keyframe_files = sorted([f for f in os.listdir(output_dir) if f.endswith('.jpg')])
+        if not keyframe_files:
+            return None
+            
+        keyframes = []
+        for filename in keyframe_files:
+            try:
+                # 从文件名提取时间戳
+                timestamp = parse_timestamp_from_filename(filename)
+                
+                # 读取图片文件
+                img_path = os.path.join(output_dir, filename)
+                frame = cv2.imread(img_path)
+                
+                if frame is not None:
+                    # 重新编码为base64
                     _, buffer = cv2.imencode(".jpg", frame)
                     image_b64 = base64.b64encode(buffer).decode("utf-8")
+                    
                     keyframes.append({
                         "timestamp": timestamp,
                         "image_b64": image_b64,
-                        "ssim": None
+                        "frame": frame
                     })
-                    last_frame = frame
                 else:
-                    sim = _compute_ssim(last_frame, frame)
-                    
-                    if sim < current_threshold:
-                        # 检测到变化，设置标志但不立即保存
-                        change_detected = True
-                        stable_counter = 0
-                        last_frame = frame  # 更新参考帧
-                    else:
-                        # 没有变化或变化很小
-                        if change_detected:
-                            # 在变化后等待一段时间再保存
-                            stable_counter += 1
-                            if stable_counter >= stable_delay:
-                                # 保存稳定的中间帧
-                                _, buffer = cv2.imencode(".jpg", frame)
-                                image_b64 = base64.b64encode(buffer).decode("utf-8")
-                                keyframes.append({
-                                    "timestamp": timestamp,
-                                    "image_b64": image_b64,
-                                    "ssim": sim
-                                })
-                                last_frame = frame
-                                change_detected = False
-                                stable_counter = 0
-                        else:
-                            # 正常情况，没有检测到变化，直接保存
-                            _, buffer = cv2.imencode(".jpg", frame)
-                            image_b64 = base64.b64encode(buffer).decode("utf-8")
-                            keyframes.append({
-                                "timestamp": timestamp,
-                                "image_b64": image_b64,
-                                "ssim": sim
-                            })
-                            last_frame = frame
-        
-        cap.release()
-        return keyframes
+                    print(f"无法读取图片: {img_path}")
+            except (ValueError, Exception) as e:
+                print(f"加载缓存图片 {filename} 时出错: {e}")
+                continue
+                
+        return keyframes if keyframes else None
+
+    # 检查是否已有缓存的关键帧图片
+    output_dir = f"./keyframes/{file_name}"
+    if  start_time:
+        output_dir += f"_{start_time}"
+    if  end_time:
+        output_dir += f"_{end_time}"
+    cached_keyframes = load_cached_keyframes(output_dir)
     
-    def _resample_frames(frames, target_count):
-        """对关键帧进行二次抽帧"""
-        if len(frames) <= target_count:
-            return frames
-            
-        # 按时间戳排序
-        sorted_frames = sorted(frames, key=lambda x: x["timestamp"])
-        
-        # 保留第一帧和最后一帧
-        result = [sorted_frames[0]]
-        
-        if target_count > 2:
-            # 计算需要额外选择的帧数
-            remaining_count = target_count - 2
-            
-            # 计算时间间隔
-            total_duration = sorted_frames[-1]["timestamp"] - sorted_frames[0]["timestamp"]
-            interval = total_duration / (remaining_count + 1)
-            
-            # 选择时间上均匀分布的帧
-            target_timestamps = [sorted_frames[0]["timestamp"] + (i + 1) * interval 
-                               for i in range(remaining_count)]
-            
-            # 为每个目标时间戳找到最接近的帧
-            for target_ts in target_timestamps:
-                closest_frame = min(sorted_frames[1:-1], 
-                                  key=lambda x: abs(x["timestamp"] - target_ts))
-                if closest_frame not in result:
-                    result.append(closest_frame)
-            
-        result.append(sorted_frames[-1])
-        return sorted(result, key=lambda x: x["timestamp"])
-    
-    # 第一次提取
-    keyframes = _extract_frames(ssim_th)
-    frame_count = len(keyframes)
-    
+    if cached_keyframes is not None:
+        print(f"使用缓存的关键帧，数量: {len(cached_keyframes)}")
+        return cached_keyframes
+
+    # 如果没有缓存，进行正常处理
+    print("未找到缓存，开始处理视频...")
     min_target, max_target = target_frame_count
+    current_threshold = ssim_th
+    iteration = 0
+    frames = _extract_frames()
     
-    print(f"初始提取帧数: {frame_count}, 使用阈值: {ssim_th}")
-    
-    # 如果帧数不在目标范围内，调整阈值
-    if frame_count < min_target:
-        # 帧数太少，降低阈值（更敏感）
-        adjusted_threshold = ssim_th * 0.8  # 降低阈值
-        print(f"帧数过少，调整阈值到: {adjusted_threshold}")
-        keyframes = _extract_frames(adjusted_threshold)
-        frame_count = len(keyframes)
+    # 保存所有帧（可选）
+    all_frames_dir = f"./keyframes/{file_name}_all"
+    save_keyframe_images_simple(frames, output_dir=all_frames_dir)
+    print(f"帧数量: {len(frames)}")
+
+    best_keyframes = []
+    while iteration < max_iterations:
+        print(f"\n迭代 {iteration + 1}, 使用SSIM阈值: {current_threshold:.3f}")
+        keyframes = filter_frames_by_ssim(frames, current_threshold)
+        keyframe_count = len(keyframes)
         
-    elif frame_count > max_target:
-        # 帧数太多，提高阈值（更严格）
-        adjusted_threshold = ssim_th * 1.2  # 提高阈值
-        print(f"帧数过多，调整阈值到: {adjusted_threshold}")
-        keyframes = _extract_frames(adjusted_threshold)
-        frame_count = len(keyframes)
-    
-    # 如果调整阈值后仍然太多，进行二次抽帧
-    if frame_count > max_target:
-        print(f"调整阈值后仍有 {frame_count} 帧，进行二次抽帧")
-        keyframes = _resample_frames(keyframes, max_target)
-    
-    print(f"最终帧数: {len(keyframes)}")
-    return keyframes
+        print(f"筛选后关键帧数量: {keyframe_count}")
 
-
-####111
-
-
-
-def deduplicate_keyframes_by_ssim(
-    keyframes: List[Dict[str, Any]], 
-    ssim_threshold: float = 0.85
-) -> List[Dict[str, Any]]:
-    """
-    根据SSIM值去除相似的关键帧
-    
-    Args:
-        keyframes: 原始关键帧列表
-        ssim_threshold: SSIM阈值，高于此值认为帧相似
+        # 检查是否在目标范围内
+        if min_target <= keyframe_count <= max_target:
+            print(f"达到目标帧数范围: {keyframe_count}")
+            best_keyframes = keyframes
+            break
+        elif keyframe_count < min_target:
+            # 帧数太少，降低阈值（更宽松）
+            current_threshold += 0.01
+            print(f"帧数过少 ({keyframe_count} < {min_target})，提升阈值至: {current_threshold:.3f}")
+        else:
+            # 帧数太多，提高阈值（更严格）
+            current_threshold *= 0.9
+            print(f"帧数过多 ({keyframe_count} > {max_target})，降低阈值至: {current_threshold:.3f}")
         
-    Returns:
-        去重后的关键帧列表
-    """
-    if not keyframes:
-        return []
+        # 防止阈值超出合理范围
+        current_threshold = max(0.1, min(1, current_threshold))
+        if current_threshold > 1 or current_threshold < 0.1:
+            break
+        iteration += 1
     
-    # 第一帧总是保留
-    deduplicated = [keyframes[0]]
+    # 如果迭代结束仍未达到目标，使用最后一次的结果
+    if not best_keyframes and keyframes:
+        print(f"达到最大迭代次数，使用当前结果: {len(keyframes)} 帧")
+        best_keyframes = keyframes
     
-    for i in range(1, len(keyframes)):
-        current_frame = keyframes[i]
-        last_kept_frame = deduplicated[-1]
-        
-        # 如果当前帧与上一保留帧的SSIM值低于阈值，则保留
-        if current_frame["ssim"] is None or last_kept_frame["ssim"] is None:
-            # 如果任一帧没有SSIM值，默认保留
-            deduplicated.append(current_frame)
-        elif current_frame["ssim"] < ssim_threshold:
-            deduplicated.append(current_frame)
-        # 如果SSIM高于阈值，跳过当前帧（不保留）
-    
-    print(f"去重前: {len(keyframes)} 帧, 去重后: {len(deduplicated)} 帧")
-    return deduplicated
+    # 保存最终关键帧（作为缓存）
+    if best_keyframes:
+        save_keyframe_images_simple(best_keyframes, output_dir=output_dir)
+
+    return best_keyframes
 
 
 # ==========================
@@ -580,7 +750,10 @@ async def video_understanding(
     如"在第30秒到第32秒中，搜索框中的文本的第二个汉字是什么？"
     """
     from pypinyin import lazy_pinyin
-    file_name = "".join(lazy_pinyin(path.split('\\')[-1].split('.')[0]))
+    from pathlib import Path
+
+    file_name = "".join(lazy_pinyin(Path(path).stem))   
+    log.info(f"file_name:{file_name}")
     file_description = await get_basic_video_info(path)
 
     path_str = str(path).strip()
@@ -590,45 +763,49 @@ async def video_understanding(
             root_path = here.parent.parent.parent
             if root_path.exists():
                 path = str(root_path / path_str.lstrip('./'))
-    log.info(f"path_str：{path_str}")
+    log.info(f"path:{path}")
 
     transcription = ""
+    try:
+        start_time = float(start_time) if start_time is not None else None
+    except (ValueError, TypeError):
+        start_time = None
 
-    print(VIDEO_QA_PROMPT.format(transcription=transcription, question=vlm_prompt,file_name = file_name, file_description = file_description))
-
-    frames = extract_keyframes_with_ssim(path, start_time, end_time, fps=0.5)  # 低频抽一帧即可
+    try:
+        end_time = float(end_time) if end_time is not None else None
+    except (ValueError, TypeError):
+        end_time = None
+    frames = extract_keyframes_with_ssim(path, start_time, end_time, file_name)  # 低频抽一帧即可
     log.info(f"frames num：{len(frames)}")
 
-    save_keyframe_images_simple(frames,output_dir=f".\keyframes\{file_name}",)
-    # save_keyframe_images_simple(frames,output_dir=f".\keyframes\\",)
 
 
     if not frames:
         return "未提取到任何帧。"
-    # 取中间一帧
-    frame = frames[len(frames) // 2]
 
 
 
-    user_message = [
-        {
-            "type": "text",
-            "text": VIDEO_QA_PROMPT.format(transcription=transcription, question=vlm_prompt,file_name = file_name, file_description = file_description),
-        },
-        *(
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame['image_b64']}"}}
-            for frame in frames
-        ),
-    ]
 
-    resp =  client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": user_message}],
-    )
+    # user_message = [
+    #     {
+    #         "type": "text",
+    #         "text": VIDEO_QA_PROMPT.format(transcription=transcription, question=vlm_prompt,file_name = file_name, file_description = file_description),
+    #     },
+    #     *(
+    #         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame['image_b64']}"}}
+    #         for frame in frames
+    #     ),
+    # ]
+    
+    # resp =  client.chat.completions.create(
+    #     model=model,
+    #     messages=[{"role": "user", "content": user_message}],
+    # )
 
     return {
         "status": "success",
-        "analysis": resp.choices[0].message.content,
+        # "analysis": resp.choices[0].message.content,
+        "analysis": "resp.choices[0].message.content",
     }
 
 
@@ -638,13 +815,13 @@ async def video_understanding(
 if __name__ == "__main__":
     mcp.run()
     # async def _test():
+    #     for i in ['采销介绍','逛京东_副本','买iphone_副本','grgww5','iphone','kadj4','kxjs3','qkvn6']:
+    #         video_path = rf"F:\project\agent\jd\hzz\jd_multi\test\{i}.mp4"
 
-    #     video_path = "./cache_dir/uploads/20251106114244_买iphone_副本.mp4"
 
-
-    #     # 示例 2：简单问题回答
-    #     prompt2 = "用户加入购物车的第一个商品内存版本比相同配色的最小内存版本大了多少？单位GB，直接输出数字"
-    #     answer = await  video_understanding(video_path, prompt2)
-    #     # answer = video_understanding(video_path, prompt2, start_time=30, end_time=32)
-    #     print(answer)
+    #         # 示例 2：简单问题回答
+    #         prompt2 = "用户加入购物车的第一个商品内存版本比相同配色的最小内存版本大了多少？单位GB，直接输出数字"
+    #         answer = await  video_understanding(video_path, prompt2)
+    #         # answer = video_understanding(video_path, prompt2, start_time=30, end_time=32)
+    #         print(answer)
     # asyncio.run(_test())
