@@ -18,7 +18,7 @@ mcp = FastMCP("")
 
 # -------------------- MCP 工具 --------------------
 
-@mcp.tool(description="列出目录内容，支持文件类型过滤和递归搜索")
+@mcp.tool(description="列出目录内每个文件名字，大小（字节），类型，时间，支持文件类型过滤和递归搜索")
 async def list_directory(
     path: str = Field(description="目录路径"),
     file_type: Optional[str] = Field(default=None, description="文件类型过滤，如 '.txt', '.py' 等"),
@@ -149,9 +149,9 @@ async def count_files(
 
 
 
-@mcp.tool(description="获取文件/目录详细信息")
+@mcp.tool(description="获取文件详细信息")
 async def get_file_info(
-    path: str = Field(description="文件或目录路径")
+    path: str = Field(description="文件路径")
 ) -> Dict[str, Any]:
     """获取文件或目录的详细信息"""
     try:
@@ -173,29 +173,6 @@ async def get_file_info(
             "permissions": stat.filemode(stat_info.st_mode),
             "absolute_path": str(path_obj.resolve())
         }
-        
-        # 如果是目录，添加额外信息
-        if path_obj.is_dir():
-            file_count = 0
-            dir_count = 0
-            total_size = 0
-            
-            try:
-                for item in path_obj.iterdir():
-                    if item.is_file():
-                        file_count += 1
-                        total_size += item.stat().st_size
-                    elif item.is_dir():
-                        dir_count += 1
-            except (PermissionError, OSError):
-                pass
-            
-            info.update({
-                "file_count": file_count,
-                "directory_count": dir_count,
-                "total_size": total_size
-            })
-        
         return {
             "status": "success",
             "info": info
@@ -203,6 +180,37 @@ async def get_file_info(
         
     except Exception as e:
         return {"error": f"获取文件信息失败: {str(e)}"}
+
+
+@mcp.tool(description="创建目录（支持多级父目录自动创建；相对路径自动按当前工作目录拼接）")
+async def create_directory(
+    path: str = Field(description="待创建目录路径")
+) -> Dict[str, Any]:
+    try:
+        p = Path(path)
+        # 不是绝对路径 -> 拼成绝对路径
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        p.mkdir(parents=True, exist_ok=True)
+        return {"status": "success", "action": "create", "path": str(p)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@mcp.tool(description="获取目录磁盘占用大小，单位 KB")
+async def get_dir_size_kb(
+    path: str = Field(description="目录路径")
+) -> Dict[str, Any]:
+    try:
+        p = Path(path)
+        if not p.is_dir():
+            return {"status": "error", "message": "路径不是目录"}
+        # 不是绝对路径 -> 拼成绝对路径
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        total_bytes = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+        return {"status": "success", "path": str(p), "size_kb": total_bytes/ 1024}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 # -------------------- 启动 --------------------
 if __name__ == "__main__":

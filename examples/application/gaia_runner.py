@@ -1213,6 +1213,16 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 	)
 	oxy_space.append(audio_mcp)
 
+	# Hf File MCP 工具
+	hf_file_mcp = oxy.StdioMCPClient(
+		name="hf_file_tools",
+		params={
+			"command": "uv",
+			"args": ["--directory", "./mcp_servers", "run", "hf-mirror/server.py"],
+		},
+	)
+	oxy_space.append(hf_file_mcp)
+
 	# 注册 video_mcp
 	video_mcp = oxy.StdioMCPClient(
 		name="video_tools",
@@ -1535,7 +1545,39 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 		)
 	)
 
+	hf_file_tools_list = ["hf_file_tools"]
 
+	oxy_space.append(
+		oxy.ReActAgent(
+			name="hf_file_agent",
+			desc="Perform HuggingFace dataset operations including: download datasets and read Parquet files.",
+			tools=hf_file_tools_list,
+			llm_model="zai-org/GLM-4.5",
+			additional_prompt=(
+"""
+ROLE: HuggingFace Data Specialist
+SCOPE:Perform HuggingFace dataset operations including: download datasets and read Parquet files.
+LIMITATIONS:
+- Only operates on HuggingFace datasets within allowed repositories
+- Parquet reading is limited to valid file paths and row ranges within dataset bounds
+- Does NOT perform mathematical calculations - only extracts data from datasets
+POLICY:
+1. For dataset download: Use hf_download with explicit repo_id and repo_type parameters
+2. For data extraction: Use parquet_read with the 1-based row number and the exact file path
+3. For answers in dataset: If the 'answer' field exists in the data, return its value directly, **explicitly indicating to the next agent that this is the final, ready-to-use result.**
+4. For questions without answers: Return the question and indicate need for external calculation
+5. For multi-step tasks: Execute operations in sequence - download → read → return data
+6. For error handling: Verify download success before reading, validate row numbers before extraction
+OUTPUT STRATEGY:
+- Complete data: If both question and answer fields exist, return answer value directly
+- Question only: If only question field exists, return question with needs_calculation flag
+- Validation: If answer exists but verification needed, return both for cross-check
+OUTPUT: Return tool results directly, numerical answers when available, or structured data with questions needing calculation. Be concise but include critical details.
+	"""
+			),
+			timeout=300,
+		)
+	)
 
 	dictionary_tools_list = ["file_tools"]
 	if "dictionary_tools" in available_tools:
@@ -1546,7 +1588,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			name="directory_agent",
 			desc="Directory Operations Specialist – handle file/directory creation, reading, writing, deletion, info query, counting, and listing.",
 			tools=dictionary_tools_list,
-			llm_model="zai-org/GLM-4.5",
+			llm_model="default_llm",
 			additional_prompt=(
            "ROLE: File Operations Specialist\n"
             "SCOPE: Perform file/directory operations including: create/write/overwrite, read content, delete, get details, count specific file types, and list directory contents.\n"
@@ -1560,6 +1602,8 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
             "4. For counting: Use count_files with path, optional file_type (e.g., '.txt'), and recursive flag as needed.\n"
             "5. For listing: Use list_directory with filters (file_type) and recursion as requested.\n"
             "6. For file details (size, modified time, etc.): Use get_file_info.\n"
+            "7. For dictionary creates: Use create_directory.\n"
+            "8. For dictionary size: Use get_dir_size_kb.\n"
             "OUTPUT: Return tool results directly, or error messages if operations fail. Be concise but include critical details (e.g., 'Deleted: /path' or 'Count: 5 .txt files').\n"
 			),
 			timeout=120,
@@ -1574,7 +1618,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				desc="Audio Processing Agent – ASR transcription and song recognition via audio fingerprint.",
 				tools=["audio_tools"],
 				llm_model="default_llm",
-				additional_prompt=(
+				prompt=(
 				'''
 					ROLE: Audio Processing Specialist
 
@@ -1695,7 +1739,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			desc="Video Understanding Specialist – analyze video content through key-frame extraction and visual question answering.",
 			tools=video_tools_list,
 			llm_model="zai-org/GLM-4.5",
-			additional_prompt=(
+			prompt=(
 				'''
 				ROLE: Video Understanding Specialist  
 				SCOPE: Perform video analysis including: extract basic metadata (size, duration, resolution, frame-rate), sample key frames, and answer user questions grounded in those frames.  
@@ -1834,6 +1878,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- 'web': Web search, browser automation, and extraction (github, youtube, wikipedia, 链接, 网页, 仓库, 搜索, 查找, 浏览器, 自动化, 点击, 填写, 表单)\n"
 				"- 'audio': Audio transcription (音频/语音/录音/asr/转写: wav/mp3/m4a/flac). File_Name must be an audio file.\n"
 				"- 'file': File content extraction/analysis (read pdf, extract text from images, analyze document content).\n"
+				"- 'hf-file': Huggingface or hf-mirror download parquet file, read file content.\n"
 				"- 'directory': Directory Operations  – handle file/directory creation, reading, writing, deletion, info query, counting, and listing.\n"
 				"- 'video': Video Understanding Specialist – analyze video content through key-frame extraction and visual question answering.\n"
 				"  * NOT for counting files or listing directories - that's 'math'.\n"
@@ -1864,7 +1909,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			name="master_agent",
 			sub_agents=[
 				"router_agent", "math_agent", "time_agent", 
-				"web_agent", "audio_agent", "file_agent","directory_agent", "normalizer_agent", "video_agent"
+				"web_agent", "audio_agent", "file_agent", "hf_file_agent", "directory_agent", "normalizer_agent", "video_agent"
 			],
 			tools=[
 				# guard & utils
@@ -1912,25 +1957,87 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"   - If file_agent returns error/empty/unable_to_process (especially for counting/statistics tasks), automatically retry with math_agent.\n"
 				"   - If any agent fails but task involves counting/statistics/calculation, use math_agent as fallback.\n"
 				"   - If web_agent returns incomplete or unclear information, you may retry with more specific query or different extraction method.\n"
-				"4) Normalize (CRITICAL - MANDATORY STEP): After any specialist returns a candidate answer, you MUST ALWAYS call normalizer_agent before finalizing.\n"
-				"   - This step is NOT optional. You MUST call normalizer_agent with format: 'Question: [original question] Candidate: [specialist agent output]'\n"
-				"   - normalizer_agent will clean and format the answer, returning it wrapped in <FINAL_ANSWER>...</FINAL_ANSWER> tags.\n"
-				"   - Extract the content from <FINAL_ANSWER> tags and use that as your final output.\n"
-				"   - If normalizer_agent returns 'invalid_format', you may fall back to the original candidate, but you MUST still attempt the call.\n"
-				"   - DO NOT skip this step or return the raw specialist output without normalization.\n"
+				"4) Semantic Filtering & Normalization (CRITICAL - TWO-PART STEP):\n"
+				"\n"
+				"   - PART A: Semantic Filtering (Master Agent's Core Responsibility):\n"
+				"\n"
+				"     - **Active Constraint Identification (CRITICAL):**\n"
+				"       - Before reviewing the `candidate_answer`, your **first step** is to internally analyze and **list all key constraints** from the `original question`.\n"
+				"       - (Internal Thought Example: \"Question: ...' -> My Constraints Checklist: [1. 'only one', 2. 'in descending order', 3. 'must be Chinese name']\").\n"
+				"       - This checklist is your guide for the next steps.\n"
+				"\n"
+				"     - **Constraint Check (CRITICAL):**\n"
+				"       - Now, use your internal **Constraints Checklist** to review the `candidate_answer` provided by the specialist.\n"
+				"       - Common constraints: 'one'/'only one', 'how many', 'official name', 'in order' (e.g., 'descending'), 'only separated by...', 'Chinese name' (or other language), 'except for...', etc.\n"
+				"\n"
+				"     - **Answer Refinement & Triage (CRITICAL):**\n"
+				"       - If the `candidate_answer` violates any constraints, you must fix it. **Use this Triage Priority:**\n"
+				"\n"
+				"       - **(Triage Priority 1: Self-Refine):**\n"
+				"         - If the `candidate_answer` is merely *verbose*, *needs reformatting/calculation*, or *violates a filter/order constraint* AND you have all the information, you **MUST** fix it yourself. **This is your job.**\n"
+				"         - (See Case 1, 4, 5, 6 below for examples).\n"
+				"\n"
+				"       - **(Triage Priority 2: Re-call Specialist):**\n"
+				"         - If the `candidate_answer` has a *critical content/factual error* (e.g., wrong language, wrong information) OR is *missing information* that prevents Self-Refinement, you **MUST** re-call the specialist.\n"
+				"         - (See Case 2, 3 below for examples).\n"
+				"\n"
+				"     - **Refinement Examples:**\n"
+				"       - **(Case 1: Single Constraint):** Q: \"one\" primary contact. Specialist: \"Email, Phone, Address\".\n"
+				"         - **Action: Self-Refine.** Select \"Email\" (based on context or as default).\n"
+				"       - **(Case 4 - NEW: Ordering Constraint):** Q: \"list winners **in order** of rank (high to low)\". Specialist: \"Silver, Gold, Bronze\".\n"
+				"         - **Action: Self-Refine.** Re-sort the list: \"Gold, Silver, Bronze\".\n"
+				"       - **(Case 5 - NEW: Calculation Constraint):** Q: \"**how many** departments?\" Specialist: \"We have Sales, Marketing, and Engineering.\"\n"
+				"         - **Action: Self-Refine.** Count the items: \"3\".\n"
+				"       - **(Case 6 - NEW: Exclusion Constraint):** Q: \"all departments **except** 'Sales'\". Specialist: \"Sales, Marketing, Engineering\".\n"
+				"         - **Action: Self-Refine.** Filter the list: \"Marketing, Engineering\".\n"
+				"       - **(Case 2: Content Error):** Q: \"list **original** names, **only** commas\". Specialist: (Translates names to English).\n"
+				"         - **Action: Re-call Specialist.** (Cannot be self-refined). \"Re-call: 'Return original *Chinese* names...'\"\n"
+				"       - **(Case 3: Factual Error):** Q: \"**official name**\". Specialist: (Returns model code).\n"
+				"         - **Action: Re-call Specialist.** (Cannot be self-refined). \"Re-call: 'Verify...'\"\n"
+				"\n"
+				"     - **(Failure Fallback):**\n"
+				"       - If you cannot Self-Refine and Re-call also fails, you **MUST NOT** pass a guessed or faulty answer to PART B.\n"
+				"       - Return a clear error (e.g., `unable_to_verify_answer_semantically`) as your final answer.\n"
+				"\n"
+				"   - PART B: Format Normalization (Call Normalizer):\n"
+				"     - **ONLY AFTER** completing PART A filtering and obtaining a clean, semantically correct `refined_candidate_answer`, you may call `normalizer_agent`.\n"
+				"     - Call `normalizer_agent` with format: 'Question: [original question] Candidate: [YOUR_REFINED_CANDIDATE_ANSWER]'\n"
+				"       - (Note: Candidate here is your refined result, NOT the raw specialist output)\n"
+				"     - `normalizer_agent` will return content wrapped in <FINAL_ANSWER>...</FINAL_ANSWER> tags.\n"
+				"     - Extract the content from the tags as your final answer.\n"
 				"5) Commit Final Answer (GUARD): After normalization, call final_answer_guard('commit', answer, answer_type). If commit succeeds, proceed.\n"
 				"6) Persist Case (AFTER success): If guard commit succeeded, call case_save(...) then case_update_score(success:true, latency_ms?).\n"
 				"7) On Failure/Timeout: call case_update_score(success:false) and todo_autogen_from_case({case_id, reason, attach}).\n"
 				"RULES:\n"
-				"- ALWAYS check for missing information (especially time) BEFORE routing.\n"
+				"- ALWAYS check for missing information (especially time) BEFORE routing (WORKFLOW Step 0).\n"
 				"- When calling router_agent, pass the FULL query string (including any File_Name context and supplemented information).\n"
 				"- When calling audio_agent/file_agent, ALWAYS pass the FULL query string (including File_Name) so they can extract file paths.\n"
-				"- **CRITICAL**: You MUST call normalizer_agent after receiving any specialist agent's output. This is a mandatory step, not optional.\n"
-				"- **CRITICAL**: Your final output MUST be the result from normalizer_agent (extracted from <FINAL_ANSWER> tags), not the raw specialist output.\n"
-				"- Be aware that information from web sources may not always be accurate - trust but verify when possible.\n"
-				"- Keep chain-of-thought internal; do not output reasoning.\n"
-				"- No prefixes (Answer:/Result:) or extra lines.\n"
-				"- The final output must be the normalized answer string only (from normalizer_agent).\n"
+				"- Be aware that information from web sources may not always be accurate - trust but verify when possible, or re-call the specialist.\n"
+				"\n"
+				"# --- V8 Rules Start (Replaces old CRITICAL rules) ---\n"
+				"\n"
+				"- **CRITICAL (Step 4A - Constraint Check):**\n"
+				"  - Before reviewing any specialist answer, you MUST **actively identify all constraints** from the original question (e.g., 'only one', 'in order', 'Chinese name'). This is your checklist.\n"
+				"\n"
+				"- **CRITICAL (Step 4A - Triage Priority):**\n"
+				"  - When reviewing the specialist's `candidate_answer`, you MUST follow this Triage Priority:\n"
+				"  - **1. Self-Refine:** If the answer is merely verbose, needs filtering/sorting/counting, but *contains* the correct data, you **MUST** fix it yourself (e.g., re-order a list, count items).\n"
+				"  - **2. Re-call Specialist:** If the answer has a *critical content error* (e.g., wrong language, factual error) or is *missing information*, you **MUST** re-call the specialist with a more precise query.\n"
+				"\n"
+				"- **CRITICAL (Step 4B - Normalization):**\n"
+				"  - You MUST call `normalizer_agent` *only* on your clean `refined_candidate_answer` (NOT the raw specialist output).\n"
+				"  - Your final output MUST be the content extracted from the `normalizer_agent`'s `<FINAL_ANSWER>` tag.\n"
+				"\n"
+				"- **CRITICAL (Failure Fallback):**\n"
+				"  - If Step 4A fails (you cannot Self-Refine AND Re-call also fails), you **MUST NOT** guess.\n"
+				"  - Your final output in this case must be a clear error message (e.g., `unable_to_verify_semantic_constraints`).\n"
+				"\n"
+				"- **CRITICAL (Output Format):**\n"
+				"  - Keep chain-of-thought internal; do not output reasoning.\n"
+				"  - No prefixes (Answer:/Result:) or extra lines.\n"
+				"  - The final output must ONLY be the result from Step 4B (the normalized answer) or the Step 4A Fallback (the error message).\n"
+				"\n"
+				"# --- V8 Rules End ---\n"
 			),
 			timeout=180,
 		)
