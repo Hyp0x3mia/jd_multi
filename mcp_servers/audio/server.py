@@ -159,7 +159,7 @@ async def audio_transcribe(
                 # 可根据服务支持情况添加：temperature、response_format、language 等
             )
         
-        # resp = await loop.run_in_executor(None, _transcribe)
+        resp = await loop.run_in_executor(None, _transcribe)
         # SDK 返回对象不同版本可能不同，兼容 text/content 两种取法
         text = None
         if hasattr(resp, "text") and resp.text:

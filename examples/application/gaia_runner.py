@@ -1574,7 +1574,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				desc="Audio Processing Agent – ASR transcription and song recognition via audio fingerprint.",
 				tools=["audio_tools"],
 				llm_model="default_llm",
-				additional_prompt=(
+				prompt=(
 				'''
 					ROLE: Audio Processing Specialist
 
@@ -1695,7 +1695,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			desc="Video Understanding Specialist – analyze video content through key-frame extraction and visual question answering.",
 			tools=video_tools_list,
 			llm_model="zai-org/GLM-4.5",
-			additional_prompt=(
+			prompt=(
 				'''
 				ROLE: Video Understanding Specialist  
 				SCOPE: Perform video analysis including: extract basic metadata (size, duration, resolution, frame-rate), sample key frames, and answer user questions grounded in those frames.  
@@ -1912,12 +1912,22 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"   - If file_agent returns error/empty/unable_to_process (especially for counting/statistics tasks), automatically retry with math_agent.\n"
 				"   - If any agent fails but task involves counting/statistics/calculation, use math_agent as fallback.\n"
 				"   - If web_agent returns incomplete or unclear information, you may retry with more specific query or different extraction method.\n"
-				"4) Normalize (CRITICAL - MANDATORY STEP): After any specialist returns a candidate answer, you MUST ALWAYS call normalizer_agent before finalizing.\n"
-				"   - This step is NOT optional. You MUST call normalizer_agent with format: 'Question: [original question] Candidate: [specialist agent output]'\n"
-				"   - normalizer_agent will clean and format the answer, returning it wrapped in <FINAL_ANSWER>...</FINAL_ANSWER> tags.\n"
-				"   - Extract the content from <FINAL_ANSWER> tags and use that as your final output.\n"
-				"   - If normalizer_agent returns 'invalid_format', you may fall back to the original candidate, but you MUST still attempt the call.\n"
-				"   - DO NOT skip this step or return the raw specialist output without normalization.\n"
+				"4) Semantic Filtering & Normalization (CRITICAL - TWO-PART STEP):\n"
+				"   - PART A: Semantic Filtering (Master Agent's Core Responsibility):\n"
+				"     - When you receive a raw candidate_answer from a specialist agent (e.g., web_agent), you **MUST NOT** blindly pass it to normalizer_agent without review.\n"
+				"     - You **MUST** first perform **cross-comparison and semantic review** between the candidate_answer and the original question.\n"
+				"     - **Constraint Check (CRITICAL):** You MUST check if the specialist agent violated any **key constraint keywords** in the original question.\n"
+				"       - Example constraints include: 'one'/'only one', 'how many', 'official name', 'in order', 'only separated by...', 'Chinese name', etc.\n"
+				"     - **Answer Refinement (CRITICAL):** If candidate_answer violates constraints (e.g., question asks for 'one' but answer provides a list), you **MUST** extract the most likely correct answer from the verbose response yourself.\n"
+				"       - **(Case 1: Single Constraint):** If question asks for \"**one** primary contact method\" but specialist returns a list \"Email, Phone, Address...\", you must determine which is \"primary\" by reading context (if provided) or select the first. Your refined_candidate_answer should be \"Email\", not the entire list.\n"
+				"       - **(Case 2: Format & Content Constraint):** If question asks to \"list department names, **only** separated by commas\" but specialist not only used commas but also *modified content* (e.g., changed \"销售部\" to \"Sales_Dept\"), you must recognize this as a content error and re-call specialist with instruction: \"return **original** names, comma-separated\".\n"
+				"       - **(Case 3: Factual Constraint):** If question asks for \"product's **official promotional name**\" but specialist returns \"Product X\" (a model code), you must recognize this may not meet \"official promotional name\" requirement and should (if possible) re-search to confirm the correct name.\n"
+				"   - PART B: Format Normalization (Call Normalizer):\n"
+				"     - **ONLY AFTER** completing PART A filtering and obtaining a clean, semantically correct refined_candidate_answer, you may call normalizer_agent.\n"
+				"     - Call normalizer_agent with format: 'Question: [original question] Candidate: [YOUR_REFINED_CANDIDATE_ANSWER]'\n"
+				"       - (Note: Candidate here is your refined result, NOT the raw specialist output)\n"
+				"     - normalizer_agent will return content wrapped in <FINAL_ANSWER>...</FINAL_ANSWER> tags.\n"
+				"     - Extract the content from the tags as your final answer.\n"
 				"5) Commit Final Answer (GUARD): After normalization, call final_answer_guard('commit', answer, answer_type). If commit succeeds, proceed.\n"
 				"6) Persist Case (AFTER success): If guard commit succeeded, call case_save(...) then case_update_score(success:true, latency_ms?).\n"
 				"7) On Failure/Timeout: call case_update_score(success:false) and todo_autogen_from_case({case_id, reason, attach}).\n"
@@ -1925,8 +1935,8 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- ALWAYS check for missing information (especially time) BEFORE routing.\n"
 				"- When calling router_agent, pass the FULL query string (including any File_Name context and supplemented information).\n"
 				"- When calling audio_agent/file_agent, ALWAYS pass the FULL query string (including File_Name) so they can extract file paths.\n"
-				"- **CRITICAL**: You MUST call normalizer_agent after receiving any specialist agent's output. This is a mandatory step, not optional.\n"
-				"- **CRITICAL**: Your final output MUST be the result from normalizer_agent (extracted from <FINAL_ANSWER> tags), not the raw specialist output.\n"
+				"- **CRITICAL**: After receiving a specialist's output, YOU MUST FIRST PERFORM SEMANTIC FILTERING (Step 4, Part A) to refine the answer based on the question's constraints.\n"
+				"- **CRITICAL**: You MUST call normalizer_agent (Step 4, Part B) on your refined_candidate_answer, NOT the raw specialist output. Your final output MUST be the result from normalizer_agent.\n"
 				"- Be aware that information from web sources may not always be accurate - trust but verify when possible.\n"
 				"- Keep chain-of-thought internal; do not output reasoning.\n"
 				"- No prefixes (Answer:/Result:) or extra lines.\n"
