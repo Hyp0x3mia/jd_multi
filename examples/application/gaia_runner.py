@@ -13,7 +13,7 @@ from oxygent import MAS, Config, oxy, preset_tools
 from pydantic import Field
 import importlib.util
 import logging
-Config.set_app_name('1108_v5')
+
 
 logger = logging.getLogger(__name__)
 """
@@ -1486,8 +1486,18 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"  * Question: 'List names, comma-separated' → Output: 'Name1,Name2,Name3'\n"
 				"  * Question: '六个板块叫什么？请仅用英文逗号间隔输出' → Output: '京东金条,白条,京东小金库,基金,保险,更多服务'\n"
 				"- Return ONLY the requested fact/value in the requested format; no extra commentary, no descriptions.\n"
+				"- If the task mentions specific 京东业务线，可直接访问对应站点：\n"
+				"  • 京东物流：https://www.jdl.com/\n"
+				"  • 京东零售：https://jdx.com/home\n"
+				"  • 京东科技：https://www.jdt.com.cn/\n"
+				"  • 京东商城帮助中心：https://help.jd.com/index.html\n"
+				"  • 京东产发：https://jdp.com.cn/\n"
+				"  • 京东官网大事记：https://about.jd.com/memorabilia/\n"
+				"  • 京东全球购：https://jdw-rule.jd.hk/\n"
+				"  • 京东公益：https://gongyi.jd.com/itemslist\n"
+				"- When searching GitHub issues (e.g., 'issue #12345', 'GitHub issue'), ALWAYS use github_api_tools FIRST if available.\n"
 			),
-				timeout=300,
+				timeout=600,
 		)
 	)
 
@@ -2358,7 +2368,7 @@ async def run_batch(
 		return
 	
 	datasets_df = pd.DataFrame(datasets)
-	logger.info(f"To process: {len(datasets)} tasks. Batch size: {batch_size}")
+	logger.info(f"To process: {len(datasets)} tasks. MAS will restart after each task (batch_size={batch_size} ignored).")
 
 	correct_count = 0
 	total_count = 0
@@ -2368,32 +2378,23 @@ async def run_batch(
 	jsonl_file = open(output_jsonl_path, "a", encoding="utf-8")
 	
 	try:
-		# 将数据集分成批次处理
-		total_batches = (len(datasets_df) + batch_size - 1) // batch_size
-		
-		for batch_idx in range(total_batches):
-			start_idx = batch_idx * batch_size
-			end_idx = min((batch_idx + 1) * batch_size, len(datasets_df))
-			batch_df = datasets_df.iloc[start_idx:end_idx]
-			
-			logger.info(f"Processing batch {batch_idx + 1}/{total_batches} (tasks {start_idx + 1}-{end_idx})")
-			
-			# 为每个批次创建新的 MAS 实例
+		total_items = len(datasets_df)
+		for position, (idx, item) in enumerate(datasets_df.iterrows(), start=1):
+			logger.info(
+				f"Processing item {position}/{total_items} (task {item.get('task_id', 'N/A')}) — restarting MAS"
+			)
 			oxy_space = build_oxy_space(enable_mcp=enable_mcp)
 			async with MAS(oxy_space=oxy_space) as mas:
-				for idx, item in batch_df.iterrows():
-					item_correct, item_total = await process_single_item(
-						mas, item, jsonl_file_path, result_dir, checkpoint_file, 
-						failed_checkpoint_file, jsonl_file, validate
-					)
-					correct_count += item_correct
-					total_count += item_total
-			
-			# 批次处理完成，MAS 实例会自动关闭
-			logger.info(f"Batch {batch_idx + 1}/{total_batches} completed. Process will restart for next batch.")
-			# 给系统一点时间释放资源
+				item_correct, item_total = await process_single_item(
+					mas, item, jsonl_file_path, result_dir, checkpoint_file,
+					failed_checkpoint_file, jsonl_file, validate
+				)
+				correct_count += item_correct
+				total_count += item_total
+			logger.info(
+				f"Item {position}/{total_items} completed. MAS instance closed; preparing next item."
+			)
 			await asyncio.sleep(1)
-			
 	finally:
 		jsonl_file.close()
 
@@ -2425,7 +2426,7 @@ def main():
 		format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 		datefmt='%Y-%m-%d %H:%M:%S'
 	)
-	
+	Config.set_app_name('1110_v6')
 	parser = argparse.ArgumentParser(description="OxyGent GAIA Runner (Simplified)")
 	parser.add_argument("--question", type=str, help="Run a single question.")
 	parser.add_argument("--input_jsonl", type=str, help="Path to input JSONL file for batch processing.")
@@ -2435,7 +2436,7 @@ def main():
 	parser.add_argument("--app_name", type=str, default="app", help="Set application name for experiment isolation.")
 	parser.add_argument("--validate", action="store_true", help="Validate results against 'answer' field in input_jsonl.")
 	parser.add_argument("--enable_mcp", action="store_true", help="Enable MCP tools (requires Node.js and MCP servers).")
-	parser.add_argument("--batch_size", type=int, default=10, help="Number of tasks to process before restarting the process (default: 10).")
+	parser.add_argument("--batch_size", type=int, default=1, help="Number of tasks to process before restarting the process (default: 10).")
 	
 	try:
 		args = parser.parse_args()
