@@ -1123,7 +1123,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
         model_name=os.getenv('DEEPSEEK_V3'),
         llm_params={'temperature': 0.01},
         semaphore=4,
-        timeout=240
+        timeout=360
     ),
         oxy.HttpLLM(
         name='Reasoning Model',
@@ -1213,6 +1213,18 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 	)
 	oxy_space.append(audio_mcp)
 
+
+	
+		# Hf File MCP 工具
+	hf_file_mcp = oxy.StdioMCPClient(
+		name="hf_file_tools",
+		params={
+			"command": "uv",
+			"args": ["--directory", "./mcp_servers", "run", "hf-mirror/server.py"],
+		},
+	)
+	oxy_space.append(hf_file_mcp)
+	hf_file_tools_list = ["hf_file_tools"]
 	# 注册 video_mcp
 	video_mcp = oxy.StdioMCPClient(
 		name="video_tools",
@@ -1342,7 +1354,49 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			timeout=300,
 		)
 	)
-	
+	oxy_space.append(
+		oxy.ReActAgent(
+			name="hf_file_agent",
+			desc="A specialist for LOCAL HuggingFace file operations. Use this for: 1. Downloading datasets (hf_download), 2. Calculating local file hashes (calculate_sha256), 3. Reading Parquet data (parquet_read).",
+			tools=hf_file_tools_list,
+			llm_model="zai-org/GLM-4.5",
+			additional_prompt=(
+				"""
+				ROLE: HuggingFace Data Specialist
+				SCOPE:Perform HuggingFace dataset operations: download datasets (hf_download), calculate local file hashes (calculate_sha256), and read Parquet files (parquet_read).
+
+				--- CRITICAL RULES (MANDATORY) ---
+
+				1. **CRITICAL - TASK COMPLETION:**
+				- When delegated a multi-step task (e.g., 'download AND calculate hash' or 'download AND read row 5'), you **MUST** complete ALL steps in sequence.
+				- **DO NOT** return to the Master Agent after only one step (like downloading).
+				- You MUST finish the entire requested chain (e.g., download -> calculate_sha256 -> return hash) before you respond.
+
+				2. **CRITICAL - LOCAL TOOLS FIRST:**
+				- For operations on *downloaded files* (like getting a hash), you **MUST** use your local tools (e.g., `calculate_sha256`).
+				- **DO NOT** suggest or imply using `web_agent` or any web scraping for information that can be derived locally from the file.
+
+				--- OTHER POLICIES ---
+
+				- LIMITATIONS:
+				- Only operates on HuggingFace datasets within allowed repositories
+				- Parquet reading is limited to valid file paths and row ranges
+				- Does NOT perform mathematical calculations - only extracts data or calculates hashes
+
+				- DATA HANDLING:
+				- For answers in dataset: If the 'answer' field exists, return its value directly, **explicitly indicating this is the final, ready-to-use result.**
+				- For questions without answers: Return the question and indicate need for external calculation
+
+				- ERROR HANDLING:
+				- Verify download success before reading/calculating. Validate row numbers before extraction.
+
+				OUTPUT STRATEGY:
+				- Return the final result of the *entire* task chain (e.g., the sha256 hash, or the data from parquet_read). Be concise.
+				"""
+			),
+			timeout=300,
+		)
+	)
 	# TimeAgent：时间/日期处理
 	oxy_space.append(
 		oxy.ReActAgent(
@@ -1376,6 +1430,18 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			additional_prompt=(
 				"ROLE: Web + Browser Specialist\n"
 				"TOOLS: http_tools; github_api_tools (Github.SearchIssues, Github.GetIssue); github_guardrails (GithubQueryBuilder); sanity_tools (ValidateAnswer); baidu_search_tools (if available); browser_tools (navigate/click/snapshot); browser_analyze_screenshot (VLM).\n"
+				"DIRECT SITE ACCESS (京东业务线):\n"
+				"- When the task mentions specific 京东业务线 or related topics, directly navigate to the corresponding official site instead of searching:\n"
+				"  • 京东物流/物流业务：https://www.jdl.com/\n"
+				"  • 京东零售/零售业务：https://jdx.com/home\n"
+				"  • 京东科技/科技业务：https://www.jdt.com.cn/\n"
+				"  • 京东商城帮助中心/帮助/规则：https://help.jd.com/index.html\n"
+				"  • 京东产发/产发业务：https://jdp.com.cn/\n"
+				"  • 京东官网大事记/历史/里程碑：https://about.jd.com/memorabilia/\n"
+				"  • 京东全球购/跨境业务：https://jdw-rule.jd.hk/\n"
+				"  • 京东公益/公益业务：https://gongyi.jd.com/itemslist\n"
+				"  • 京东健康/健康业务：https://www.jdh.com/?seoRecord"
+				"- Use browser_navigate to access these sites directly when the query matches the business line.\n"
 				"FLOW:\n"
 				"1) For GitHub tasks, FIRST use GithubQueryBuilder → Github.SearchIssues → (optional) Github.GetIssue. Compose URL issues?q=... as needed.\n"
 				"2) ANALYZE results BEFORE taking further action:\n"
@@ -1486,15 +1552,6 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"  * Question: 'List names, comma-separated' → Output: 'Name1,Name2,Name3'\n"
 				"  * Question: '六个板块叫什么？请仅用英文逗号间隔输出' → Output: '京东金条,白条,京东小金库,基金,保险,更多服务'\n"
 				"- Return ONLY the requested fact/value in the requested format; no extra commentary, no descriptions.\n"
-				"- If the task mentions specific 京东业务线，可直接访问对应站点：\n"
-				"  • 京东物流：https://www.jdl.com/\n"
-				"  • 京东零售：https://jdx.com/home\n"
-				"  • 京东科技：https://www.jdt.com.cn/\n"
-				"  • 京东商城帮助中心：https://help.jd.com/index.html\n"
-				"  • 京东产发：https://jdp.com.cn/\n"
-				"  • 京东官网大事记：https://about.jd.com/memorabilia/\n"
-				"  • 京东全球购：https://jdw-rule.jd.hk/\n"
-				"  • 京东公益：https://gongyi.jd.com/itemslist\n"
 				"- When searching GitHub issues (e.g., 'issue #12345', 'GitHub issue'), ALWAYS use github_api_tools FIRST if available.\n"
 			),
 				timeout=600,
@@ -1560,6 +1617,8 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
             "4. For counting: Use count_files with path, optional file_type (e.g., '.txt'), and recursive flag as needed.\n"
             "5. For listing: Use list_directory with filters (file_type) and recursion as requested.\n"
             "6. For file details (size, modified time, etc.): Use get_file_info.\n"
+			"7. For dictionary creates: Use create_directory.\n"
+            "8. For dictionary size: Use get_dir_size_kb.\n"
             "OUTPUT: Return tool results directly, or error messages if operations fail. Be concise but include critical details (e.g., 'Deleted: /path' or 'Count: 5 .txt files').\n"
 			),
 			timeout=120,
@@ -1575,71 +1634,116 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				tools=["audio_tools"],
 				llm_model="default_llm",
 				prompt=(
-					"ROLE: Audio Processing Specialist\n"
-					"\n"
-					"Your job is to process audio files using TWO tools: audio transcription (ASR) and song recognition (audio fingerprint).\n"
-					"\n"
-					"TOOLS AVAILABLE:\n"
-					"1) audio_transcribe: Transcribe audio to text (lyrics/speech) using ASR\n"
-					"   - Parameter: path (full file path)\n"
-					"   - Returns: transcribed text or error\n"
-					"   - Best for: lyrics, speech, or any audio with text content\n"
-					"\n"
-					"2) audio_recognize_song: Identify song by audio fingerprint (Chromaprint + AcoustID)\n"
-					"   - Parameter: path (full file path)\n"
-					"   - Returns: song title, artist, or error\n"
-					"   - Best for: music files (especially instrumental/pure music without clear lyrics)\n"
-					"\n"
-					"FILE PATH EXTRACTION:\n"
-					"The query may contain file path information in one of these formats:\n"
-					"1) Explicit file path in the query text (e.g., '/path/to/audio.wav')\n"
-					"2) File_Name field: The query may include a line like 'File_Name: /path/to/file.wav'\n"
-					"3) Extract the FIRST audio file path you find (if multiple, use the first one).\n"
-					"\n"
-					"PROCESSING STRATEGY (FLEXIBLE - USE BOTH TOOLS):\n"
-					"1) Extract the audio file path from the query.\n"
-					"2) Try audio_transcribe FIRST to get lyrics/transcription:\n"
-					"   - If successful and returns meaningful text (lyrics/speech), return that.\n"
-					"   - If returns error or empty/unclear text, proceed to step 3.\n"
-					"3) If transcription fails or query asks for song information, try audio_recognize_song:\n"
-					"   - If successful, return song title and artist.\n"
-					"   - If fails, return error message.\n"
-					"\n"
-					"DECISION LOGIC:\n"
-					"- If query asks for '歌词/lyrics/transcription/text content' → prioritize audio_transcribe\n"
-					"- If query asks for '歌曲名/song name/artist/歌手' → try audio_recognize_song first, fallback to audio_transcribe\n"
-					"- If query is general ('识别/identify/这是什么/what is this') → try both tools, use whichever succeeds\n"
-					"- If one tool succeeds, you can return that result immediately (no need to call the other)\n"
-					"- If both tools are needed for complete answer, call both and combine results\n"
-					"\n"
-					"TOOL CALL FORMAT:\n"
-					"When calling tools, respond with JSON:\n"
-					'{"think": "Extracted path: /path/to/audio.mp3. Trying audio_transcribe first...", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/audio.mp3"}}\n'
-					'Or: {"think": "Transcription failed, trying song recognition...", "tool_name": "audio_recognize_song", "arguments": {"path": "/path/to/audio.mp3"}}\n'
-					"\n"
-					"RESPONSE HANDLING:\n"
-					"- audio_transcribe response:\n"
-					"  * If contains 'text' field with meaningful content → Return '【音频转写】' + text\n"
-					"  * If contains 'error' → Try audio_recognize_song as fallback\n"
-					"- audio_recognize_song response:\n"
-					"  * If contains 'title' and 'artist' → Return '【音频识别】歌曲: {title}, 艺术家: {artist}'\n"
-					"  * If contains 'error' → Return error message\n"
-					"\n"
-					"EXAMPLES:\n"
-					"- Query: '识别这首歌的名字' → Try audio_recognize_song first\n"
-					"- Query: '转写这段音频的歌词' → Try audio_transcribe first\n"
-					"- Query: '这是什么歌曲？File_Name: /path/to/song.mp3' → Try audio_recognize_song, fallback to audio_transcribe if needed\n"
-					"\n"
-					"OUTPUT FORMAT:\n"
-					"- If transcription succeeds: Return '【音频转写】' + transcribed text\n"
-					"- If song recognition succeeds: Return '【音频识别】歌曲: {title}, 艺术家: {artist}'\n"
-					"- If both succeed: You can combine both results\n"
-					"- If both fail: Return error message\n"
-					"\n"
-					"You have access to these tools:\n"
-					"${tools_description}\n"
-					"\n"
-					"CRITICAL: Use BOTH tools flexibly. If one fails, try the other. If one succeeds, you can return that result."
+				'''
+					ROLE: Audio Processing Specialist
+
+					Your job is to process audio files using TWO tools: audio transcription (ASR) and song recognition (audio fingerprint).
+
+					TOOLS AVAILABLE:
+					1) audio_transcribe: Transcribe audio to text (lyrics/speech) using ASR
+					- Parameter: path (full file path)
+					- Returns: transcribed text or error
+					- Best for: lyrics, speech, or any audio with text content
+
+					2) audio_recognize_song: Identify song by audio fingerprint (Chromaprint + AcoustID)
+					- Parameter: path (full file path)
+					- Returns: song title, artist, or error
+					- Best for: music files (especially instrumental/pure music without clear lyrics)
+
+					3) audio_file_info: one-line extraction of essential audio metadata
+						Parameter: path (absolute file path; spaces and quotes allowed)
+						Returns: file size (MB), duration (s), bit-rate (kbps), sample-rate (Hz), channel count
+
+					FILE PATH EXTRACTION:
+					The query may contain file path information in one of these formats:
+					1) Explicit file path in the query text (e.g., '/path/to/audio.wav')
+					2) File_Name field: The query may include a line like 'File_Name: /path/to/file.wav'
+					3) Extract the FIRST audio file path you find (if multiple, use the first one).
+
+					PROCESSING STRATEGY (FLEXIBLE - USE BOTH TOOLS):
+					1) Extract the audio file path from the query.
+					2) Try audio_transcribe FIRST to get lyrics/transcription:
+					- If successful and returns meaningful text (lyrics/speech), return that.
+					- If returns Returns empty string, pure music → MAYBE pure music; Not considered a failure; immediately switch to running audio_recognize_song.
+					3) If transcription fails or query asks for song information, try audio_recognize_song:
+					- If successful, return song title and artist.
+					- If fails, return error message.
+					4) Instrumental tracks with no lyrics ≠ failure. In such cases, directly output the audio recognition result—no error message.
+					5) The uploaded file's name may not match its actual content; always base your analysis solely on what the file truly contains.
+						Example: if the filename is “春天.mp4” but the song is actually “夏天.mp4”, rely on the detected content, not the name.4					6) Auto-correct obvious filename typos, e.g. change “(a,MP4)” to “a.MP4”.
+
+
+					DECISION LOGIC:
+					- If query asks for '歌词/lyrics/transcription/text content' → prioritize audio_transcribe
+					- If query asks for '歌曲名/song name/artist/歌手' → try audio_recognize_song first, fallback to audio_transcribe
+					- If query is general ('识别/identify/这是什么/what is this') → try both tools, use whichever succeeds
+					- If one tool succeeds, you can return that result immediately (no need to call the other)
+					- If both tools are needed for complete answer, call both and combine results
+
+					TOOL CALL FORMAT:
+					When calling tools, respond with JSON:
+					{"think": "Extracted path: /path/to/audio.mp3. Trying audio_transcribe first...", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/audio.mp3"}}
+					Or: {"think": "Transcription failed, trying song recognition...", "tool_name": "audio_recognize_song", "arguments": {"path": "/path/to/audio.mp3"}}
+
+					FINAL ANSWER FORMAT:
+					When you have the final answer or need to return an error message (without calling tools), use this format:
+					<think>Your reasoning or explanation</think>
+					Your final answer or error message
+					Do NOT use JSON format with "final_answer" field when returning final answers. Use the <think> format instead.
+
+					RESPONSE HANDLING:
+					- audio_recognize_song response:
+					* If contains 'title' and 'artist' → Return '【音频识别】歌曲: {title}, 艺术家: {artist}'
+					* If contains 'error' → Return error message
+
+					- audio_transcribe response:
+					* If contains 'text' field with meaningful content → Return '【音频转写】' + text
+					* If contains 'ASR未检测到任何文本' → Try audio_recognize_song as fallback, return 字数 0
+
+
+					EXAMPLES:
+					- Query: '识别这首歌的名字' → Try audio_recognize_song first
+					- Query: '转写这段音频的歌词' → Try audio_transcribe first if
+					- Query: '这是什么歌曲？File_Name: /path/to/song.mp3' → Try audio_recognize_song, fallback to audio_transcribe if needed
+					- Query: '输出这首歌英文与中文的分别数量' → Try audio_transcribe first if
+					→ {"think": "识别中文音频转写", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/song.mp3", "vlm_prompt": "识别歌曲中文文字"}} 
+						observation{ 
+							"status": "success",
+							"analysis": "xxx"} 
+					→ {"think": "已经识别中文数量,识别英文", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/song.mp3"，"vlm_prompt": "识别歌曲英文文文字"}}  
+						observation{ 
+							"status": "success",
+							"analysis": "xxxX"}
+					→ {"think": "统计两者分别数量,给出最终答案", "tool_name": "", "arguments": {}}
+					→ return "中文的数量为3,英文的数量为4"
+
+
+					- Query: 'Output the sum counts of English and Chinese in this song'
+					→ {"think": "音频转写", "tool_name": "audio_transcribe", "arguments": {"path": "/path/to/song.mp3", "vlm_prompt": "识别歌曲中文字"}} 
+						observation{
+						"status": "success",
+						"analysis": "ASR未检测到任何文本,可能文件是纯音乐，请使用audio_recognize_song工具识别音乐名后交叉确认"}
+					→ {"think": "识别是否是纯音乐", "tool_name": "audio_recognize_song", "arguments": {"path": "/path/to/song.mp3"}} 
+						observation{ 
+							"status": "success",
+							"analysis": "月光奏鸣曲"}
+					→ {"think": "absolute music,No lyrics detected, so answer is 0", "tool_name": "", "arguments": {}}
+					→ return "ASR未检测到任何文本,因为文件是纯音乐,因此answer是0"
+
+
+					OUTPUT FORMAT:
+					- If transcription succeeds: Return text directly.
+					- If song recognition succeeds: Return recognition result directly.
+					- If transcription Returns empty string → MAYBE pure music; Not considered a failure Return 0
+					- If song recognition failed: Return "音频识别错误"
+					OUTPUT: Return only the minimal text/value(s) required by the question, OR the UNABLE_TO_PROCESS message if task is outside scope
+
+
+					You have access to these tools:
+					${tools_description}
+
+					CRITICAL: Use BOTH tools flexibly. If one fails, try the other. If one succeeds, you can return that result.
+				'''
 				),
 				timeout=600,
 			)
@@ -1656,7 +1760,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			desc="Video Understanding Specialist – analyze video content through key-frame extraction and visual question answering.",
 			tools=video_tools_list,
 			llm_model="zai-org/GLM-4.5",
-			additional_prompt=(
+			prompt=(
 				'''
 				ROLE: Video Understanding Specialist  
 				SCOPE: Perform video analysis including: extract basic metadata (size, duration, resolution, frame-rate), sample key frames, and answer user questions grounded in those frames.  
@@ -1694,7 +1798,29 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				→ {"think": "Specific visual question on 30-32 s slice", "tool_name": "video_understanding", "arguments": {"path": "/tmp/clip.mp4", "start_time": 30, "end_time": 32, "vlm_prompt": "What text is in the search box?"}}  
 
 				- Query: 'Summarize the whole video /media/intro.avi'  
-				→ {"think": "General summary needed", "tool_name": "video_understanding", "arguments": {"path": "/media/intro.avi"}}  
+								→ {"think": "General summary needed", "tool_name": "video_understanding", "arguments": {"path": "/media/intro.avi", "vlm_prompt": "summarize this video"}}  
+
+								
+				- Query: '对比三个产品，选择同一产地的商品价最低的，返回他在首页的价格'  
+				→ {"think": "对比三个产品a,b,c，分析同一产地中价格最低的", "tool_name": "video_understanding", "arguments": {"path": "/media/intro.avi", "vlm_prompt": "找到三个产品a,b,c,分析三个产品分别产地与价格，找到同一产地的产品，返回该部分产品价格最低的产品名称、价格等各信息"}} 
+					observation{ 
+						"status": "success",
+						"analysis": "a,b同一产地，c为另一产地。且a产品价格低于b"} 
+				→ {"think": "查找在首页的价格，请注意首页可能有很多相同品牌的产品，一定要找到该产品a返回价格，", "tool_name": "video_understanding", "arguments": {"path": "/media/intro.avi"，"vlm_prompt": "查找首页所有商品信息，仔细对比与返回产品信息是否一致，并找到价格"}}  
+					observation{ 
+						"status": "success",
+						"analysis": "首页有两个产品为a同品牌，结合具体页面以及首页价格分析可知产品a价格为100元"}
+
+				- Query: "请对比视频中第一次和第二次出现的商品价格，如果第一次高输出视频的时间长度，单位为秒，如果第二次高输出视频时间长度一半"
+				→ {"think": "需要先拿到第一次出现价格的商品价格与第二次出现商品的价格", "tool_name": "video_understanding", "arguments": {"path": "/media/intro.avi","vlm_prompt": "读出画面中最明显的商品标价（数字即可）"}} 
+					observation{ 
+						"status": "success",
+						"analysis": "第一次¥99,第二次¥109"} 
+				→ {"think": "第一次¥99 < 第二次¥109，第二次更高，应输出视频总时长的一半", "tool_name": "get_basic_video_info", "arguments": {"path": "/media/intro.avi"}}  
+					observation{ 
+						"status": "success",
+						"analysis": "30s"}
+
 
 				OUTPUT: Provide tool outputs directly, or concise error messages if operations fail. Include critical metadata (duration, resolution) when relevant.  
 				'''
@@ -1740,6 +1866,8 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- Input: 'Q: 官方邮箱？ C: 联系 support@example.com 获取帮助。' → Output: '<FINAL_ANSWER>support@example.com</FINAL_ANSWER>'\n"
 				"- Input: 'Q: 占比？ C: 约等于 23.5%。' → Output: '<FINAL_ANSWER>23.5%</FINAL_ANSWER>'\n"
 				"- Input: 'Q: Color? C: The color is blue.' → Output: '<FINAL_ANSWER>blue</FINAL_ANSWER>'\n"
+				"- Input: 'Q: How much do the apple and banana weigh in the basket? C: There are no apples or bananas in the basket.' → Output: '<FINAL_ANSWER>0</FINAL_ANSWER>'\n"
+				"- Input: 'Q: What is the first book in this picture? C: the first book is《活着》.' → Output: '<FINAL_ANSWER>活着</FINAL_ANSWER>'\n"
 				"- Input: 'Q: What day? C: I think it's 5' → Output: 'invalid_format'\n\n"
 				"OUTPUT:\n"
 				"Return ONLY the validated answer wrapped in <FINAL_ANSWER>...</FINAL_ANSWER> or 'invalid_format'. Do NOT use JSON format."
@@ -1771,6 +1899,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"- 'web': Web search, browser automation, and extraction (github, youtube, wikipedia, 链接, 网页, 仓库, 搜索, 查找, 浏览器, 自动化, 点击, 填写, 表单)\n"
 				"- 'audio': Audio transcription (音频/语音/录音/asr/转写: wav/mp3/m4a/flac). File_Name must be an audio file.\n"
 				"- 'file': File content extraction/analysis (read pdf, extract text from images, analyze document content).\n"
+				"- 'hf-file': Huggingface or hf-mirror download parquet file, read file content.\n"
 				"- 'directory': Directory Operations  – handle file/directory creation, reading, writing, deletion, info query, counting, and listing.\n"
 				"- 'video': Video Understanding Specialist – analyze video content through key-frame extraction and visual question answering.\n"
 				"  * NOT for counting files or listing directories - that's 'math'.\n"
@@ -1801,7 +1930,7 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 			name="master_agent",
 			sub_agents=[
 				"router_agent", "math_agent", "time_agent", 
-				"web_agent", "audio_agent", "file_agent","directory_agent", "normalizer_agent", "video_agent"
+				"web_agent", "audio_agent", "file_agent","directory_agent", "normalizer_agent", "video_agent", "hf_file_agent"
 			],
 			tools=[
 				# guard & utils
@@ -1838,6 +1967,10 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"2) Delegate: Call the appropriate specialist based on router_agent's classification.\n"
 				"   CRITICAL for file/audio agents: When calling audio_agent or file_agent, you MUST pass the FULL query string (including the File_Name field). These agents need the file path information.\n"
 				"   Example: If query contains 'File_Name: /path/to/audio.wav', pass the entire query including that line to audio_agent.\n"
+				"   **TOOL SELECTION PRINCIPLE:**\n"
+				"   - When data or files are already available locally (downloaded, cached, or previously processed), prioritize using local tools over web-based methods.\n"
+				"   - Local operations are typically faster, more reliable, and avoid unnecessary network requests.\n"
+				"   - Only use web_agent when the required information cannot be obtained from local resources or when explicitly needed for verification.\n"
 				"   INFORMATION VERIFICATION (CRITICAL):\n"
 				"   - Information from specialist agents (especially web_agent) may be incomplete, outdated, or incorrect.\n"
 				"   - If the returned answer seems suspicious or doesn't match the question, consider:\n"
@@ -1849,27 +1982,105 @@ def build_oxy_space(enable_mcp: bool = False) -> List[Any]:
 				"   - If file_agent returns error/empty/unable_to_process (especially for counting/statistics tasks), automatically retry with math_agent.\n"
 				"   - If any agent fails but task involves counting/statistics/calculation, use math_agent as fallback.\n"
 				"   - If web_agent returns incomplete or unclear information, you may retry with more specific query or different extraction method.\n"
-				"4) Normalize (CRITICAL - MANDATORY STEP): After any specialist returns a candidate answer, you MUST ALWAYS call normalizer_agent before finalizing.\n"
-				"   - This step is NOT optional. You MUST call normalizer_agent with format: 'Question: [original question] Candidate: [specialist agent output]'\n"
-				"   - normalizer_agent will clean and format the answer, returning it wrapped in <FINAL_ANSWER>...</FINAL_ANSWER> tags.\n"
-				"   - Extract the content from <FINAL_ANSWER> tags and use that as your final output.\n"
-				"   - If normalizer_agent returns 'invalid_format', you may fall back to the original candidate, but you MUST still attempt the call.\n"
-				"   - DO NOT skip this step or return the raw specialist output without normalization.\n"
-				"5) Commit Final Answer (GUARD): After normalization, call final_answer_guard('commit', answer, answer_type). If commit succeeds, proceed.\n"
+				"4) Semantic Filtering & Normalization (CRITICAL - TWO-PART STEP):\n"
+				"\n"
+				"   - PART A: Semantic Filtering (Master Agent's Core Responsibility):\n"
+				"\n"
+				"     - **Active Constraint Identification (CRITICAL):**\n"
+				"       - Before reviewing the `candidate_answer`, your **first step** is to internally analyze and **list all key constraints** from the `original question`.\n"
+				"       - (Internal Thought Example: \"Question: ...' -> My Constraints Checklist: [1. 'only one', 2. 'in descending order', 3. 'must be Chinese name']\").\n"
+				"       - This checklist is your guide for the next steps.\n"
+				"\n"
+				"     - **Constraint Check (CRITICAL):**\n"
+				"       - Now, use your internal **Constraints Checklist** to review the `candidate_answer` provided by the specialist.\n"
+				"       - Common constraints: 'one'/'only one', 'how many', 'official name', 'in order' (e.g., 'descending'), 'only separated by...', 'Chinese name' (or other language), 'except for...', etc.\n"
+				"\n"
+				"     - **Answer Refinement & Triage (CRITICAL):**\n"
+				"       - If the `candidate_answer` violates any constraints, you must fix it. **Use this Triage Priority:**\n"
+				"\n"
+				"       - **(Triage Priority 1: Self-Refine):**\n"
+				"         - If the `candidate_answer` is merely *verbose*, *needs reformatting/calculation*, or *violates a filter/order constraint* AND you have all the information, you **MUST** fix it yourself. **This is your job.**\n"
+				"         - (See Case 1, 4, 5, 6 below for examples).\n"
+				"\n"
+				"       - **(Triage Priority 2: Re-call Specialist):**\n"
+				"         - If the `candidate_answer` has a *critical content/factual error* (e.g., wrong language, wrong information) OR is *missing information* that prevents Self-Refinement, you **MUST** re-call the specialist.\n"
+				"         - (See Case 2, 3 below for examples).\n"
+				"\n"
+				"     - **Refinement Examples:**\n"
+				"       - **(Case 1: Single Constraint):** Q: \"one\" primary contact. Specialist: \"Email, Phone, Address\".\n"
+				"         - **Action: Self-Refine.** Select \"Email\" (based on context or as default).\n"
+				"       - **(Case 4 - NEW: Ordering Constraint):** Q: \"list winners **in order** of rank (high to low)\". Specialist: \"Silver, Gold, Bronze\".\n"
+				"         - **Action: Self-Refine.** Re-sort the list: \"Gold, Silver, Bronze\".\n"
+				"       - **(Case 5 - NEW: Calculation Constraint):** Q: \"**how many** departments?\" Specialist: \"We have Sales, Marketing, and Engineering.\"\n"
+				"         - **Action: Self-Refine.** Count the items: \"3\".\n"
+				"       - **(Case 6 - NEW: Exclusion Constraint):** Q: \"all departments **except** 'Sales'\". Specialist: \"Sales, Marketing, Engineering\".\n"
+				"         - **Action: Self-Refine.** Filter the list: \"Marketing, Engineering\".\n"
+				"       - **(Case 7 - NEW: Multiple Candidate Answers):** When uncertain about the correct answer and there are multiple candidate answers:\n"
+				"         - **Action: Self-Refine.** Count the frequency of each candidate answer across all sources/responses.\n"
+				"         - Select the candidate answer that appears most frequently (highest repetition count) as the final answer.\n"
+				"         - Example: If you receive \"Answer A\" 3 times, \"Answer B\" 1 time, and \"Answer C\" 2 times, choose \"Answer A\".\n"
+				"       - **(Case 2: Content Error):** Q: \"list **original** names, **only** commas\". Specialist: (Translates names to English).\n"
+				"         - **Action: Re-call Specialist.** (Cannot be self-refined). \"Re-call: 'Return original *Chinese* names...'\"\n"
+				"       - **(Case 3: Factual Error):** Q: \"**official name**\". Specialist: (Returns model code).\n"
+				"         - **Action: Re-call Specialist.** (Cannot be self-refined). \"Re-call: 'Verify...'\"\n"
+				"\n"
+				"     - **(Failure Fallback):**\n"
+				"       - If you cannot Self-Refine and Re-call also fails, you **MUST NOT** pass a guessed or faulty answer to PART B.\n"
+				"       - Return a clear error (e.g., `unable_to_verify_answer_semantically`) as your final answer.\n"
+				"\n"
+				"   - PART B: Format Normalization (Call Normalizer):\n"
+				"     - **ONLY AFTER** completing PART A filtering and obtaining a clean, semantically correct `refined_candidate_answer`, you may call `normalizer_agent`.\n"
+				"     - Call `normalizer_agent` with format: 'Question: [original question] Candidate: [YOUR_REFINED_CANDIDATE_ANSWER]'\n"
+				"       - (Note: Candidate here is your refined result, NOT the raw specialist output)\n"
+				"     - `normalizer_agent` will return content wrapped in <FINAL_ANSWER>...</FINAL_ANSWER> tags.\n"
+				"     - Extract the content from the tags and output it directly without any additional explanation or context.\n"
+				"     - Your output should be the extracted content only, not wrapped in additional narrative or explanatory text.\n"
+				"\n"
+				"5) Commit Final Answer (GUARD):\n"
+				"   - After you receive the output from `normalizer_agent` (Step 4B) and extract the `normalized_answer` from its <FINAL_ANSWER> tag.\n"
+				"   - You MUST call `final_answer_guard('commit', normalized_answer, answer_type)`.\n"
+				"   - **CRITICAL WARNING:** The `answer` argument for `final_answer_guard` **MUST BE** the `normalized_answer` from Step 4B. It **MUST NOT** be your `refined_candidate_answer` from Step 4A. Calling the guard with your own refined answer is a direct violation of the workflow.\n"
 				"6) Persist Case (AFTER success): If guard commit succeeded, call case_save(...) then case_update_score(success:true, latency_ms?).\n"
 				"7) On Failure/Timeout: call case_update_score(success:false) and todo_autogen_from_case({case_id, reason, attach}).\n"
 				"RULES:\n"
-				"- ALWAYS check for missing information (especially time) BEFORE routing.\n"
+				"- ALWAYS check for missing information (especially time) BEFORE routing (WORKFLOW Step 0).\n"
 				"- When calling router_agent, pass the FULL query string (including any File_Name context and supplemented information).\n"
 				"- When calling audio_agent/file_agent, ALWAYS pass the FULL query string (including File_Name) so they can extract file paths.\n"
-				"- **CRITICAL**: You MUST call normalizer_agent after receiving any specialist agent's output. This is a mandatory step, not optional.\n"
-				"- **CRITICAL**: Your final output MUST be the result from normalizer_agent (extracted from <FINAL_ANSWER> tags), not the raw specialist output.\n"
-				"- Be aware that information from web sources may not always be accurate - trust but verify when possible.\n"
-				"- Keep chain-of-thought internal; do not output reasoning.\n"
-				"- No prefixes (Answer:/Result:) or extra lines.\n"
-				"- The final output must be the normalized answer string only (from normalizer_agent).\n"
+				"- When data is available locally, prefer local tools over web-based methods for efficiency and reliability.\n"
+				"- Be aware that information from web sources may not always be accurate - trust but verify when possible, or re-call the specialist.\n"
+				"\n"
+				"# ---  CRITICAL rules ---\n"
+				"\n"
+				"- **CRITICAL (Step 4A - Constraint Check):**\n"
+				"  - Before reviewing any specialist answer, you MUST **actively identify all constraints** from the original question (e.g., 'only one', 'in order', 'Chinese name'). This is your checklist.\n"
+				"\n"
+				"- **CRITICAL (Step 4A - Triage Priority):**\n"
+				"  - When reviewing the specialist's `candidate_answer`, you MUST follow this Triage Priority:\n"
+				"  - **1. Self-Refine:** If the answer is merely verbose, needs filtering/sorting/counting, but *contains* the correct data, you **MUST** fix it yourself (e.g., re-order a list, count items).\n"
+				"  - **2. Re-call Specialist:** If the answer has a *critical content error* (e.g., wrong language, factual error) or is *missing information*, you **MUST** re-call the specialist with a more precise query.\n"
+				"\n"
+				"- **CRITICAL (Step 4B - Normalization):**\n"
+				"  - You MUST call `normalizer_agent` *only* on your clean `refined_candidate_answer` (NOT the raw specialist output).\n"
+				"  - Your final output MUST be the content extracted from the `normalizer_agent`'s `<FINAL_ANSWER>` tag.\n"
+				"\n"
+				"- **CRITICAL (THE FINAL LOCK - MANDATORY):**\n"
+				"  - You are **FORBIDDEN** from calling `final_answer_guard` (Step 5) with your own `refined_candidate_answer` (from Step 4A).\n"
+				"  - The *only* valid input for the `answer` argument in `final_answer_guard` is the direct, extracted output from `normalizer_agent` (Step 4B).\n"
+				"  - **Bypassing `normalizer_agent` is a critical failure.**\n"
+				"\n"
+				"- **CRITICAL (Failure Fallback):**\n"
+				"  - If Step 4A fails (you cannot Self-Refine AND Re-call also fails), you **MUST NOT** guess.\n"
+				"  - Your final output in this case must be a clear error message (e.g., `unable_to_verify_semantic_constraints`).\n"
+				"\n"
+				"- **CRITICAL (Output Format):**\n"
+				"  - Keep chain-of-thought internal; do not output reasoning.\n"
+				"  - No prefixes (Answer:/Result:) or extra lines.\n"
+				"  - The final output must be the raw content extracted from Step 4B's `<FINAL_ANSWER>` tag, or the Step 4A Fallback error message.\n"
+				"  - Do not wrap the extracted answer in explanatory sentences or add contextual information.\n"
+				"\n"
+				"# --- V8 Rules End ---\n"
 			),
-			timeout=180,
+			timeout=360,
 		)
 	)
 

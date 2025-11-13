@@ -47,21 +47,10 @@ def _compute_ssim(img1_bgr, img2_bgr) -> float:
 
 from pathlib import Path
 
-# ---------------- 可视化 / 保存同之前 ----------------
-def visualize_keyframes(keyframes: List[Dict[str, Any]], win_name: str = "Keyframes"):
-    print(f"共保留 {len(keyframes)} 帧，按任意键下一张，q 退出")
-    for idx, kf in enumerate(keyframes):
-        buf = np.frombuffer(base64.b64decode(kf["image_b64"]), np.uint8)
-        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        info = f"FRAME {idx}  TS={kf['timestamp']:.2f}s"
-        cv2.putText(img, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.imshow(win_name, img)
-        if cv2.waitKey(0) & 0xFF == ord('q'):
-            break
-    cv2.destroyAllWindows()
+
 
 import shutil, os
-
+import re
 def save_keyframe_images_simple(
     keyframes: List[Dict[str, Any]],
     output_dir: str,
@@ -69,8 +58,13 @@ def save_keyframe_images_simple(
     filename_prefix: str = "frame"
 ) -> None:
     """
-    简化版：先清空输出目录，再用索引命名保存关键帧图片
+    简化版：先清空输出目录，用_extract_frames中的时间戳命名保存关键帧图片
     """
+    import os
+    import shutil
+    import cv2
+    import numpy as np
+    
     # 1. 如果目录已存在，整个删掉
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
@@ -86,16 +80,30 @@ def save_keyframe_images_simple(
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
             if img is not None:
-                filename = f"{filename_prefix}_{i:05d}.{image_format}"
+                # 使用_extract_frames中记录的timestamp
+                timestamp = frame_info["timestamp"]
+                
+                # 将秒转换为时分秒格式
+                hours = int(timestamp // 3600)
+                minutes = int((timestamp % 3600) // 60)
+                seconds = int(timestamp % 60)
+                milliseconds = int((timestamp - int(timestamp)) * 1000)
+                
+                # 创建文件名
+                if hours > 0:
+                    # 如果视频超过1小时，包含小时信息
+                    filename = f"{filename_prefix}_{hours:02d}h{minutes:02d}m{seconds:02d}s{milliseconds:03d}ms.{image_format}"
+                else:
+                    # 如果视频在1小时内，只显示分钟和秒
+                    filename = f"{filename_prefix}_{minutes:02d}m{seconds:02d}s{milliseconds:03d}ms.{image_format}"
+                
                 filepath = os.path.join(output_dir, filename)
 
                 print(filepath)
-                # 转换为字符串并保存
                 success = cv2.imwrite(str(filepath), img)
-                # success = cv2.imwrite(filepath, img)
                 if success:
                     saved_count += 1
-                    print(f"保存: {filename} (时间戳: {frame_info['timestamp']:.3f}s)")
+                    # print(f"保存: {filename} (时间戳: {timestamp:.3f}s)")
                 else:
                     print(f"保存失败: {filename}")
             else:
@@ -105,93 +113,6 @@ def save_keyframe_images_simple(
             print(f"处理第{i}帧时出错: {str(e)}")
 
     print(f"成功保存 {saved_count} 张图片到 {output_dir}")
-# def extract_keyframes_with_ssim(
-#     video_path: str,
-#     start_time: Optional[float] = None,
-#     end_time: Optional[float] = None,
-#     fps: float = 1.0,
-#     ssim_th: float = SSIM_TH,
-#     stable_delay: int = 2  # 新增参数：跳过变化帧后的延迟帧数
-# ) -> List[Dict[str, Any]]:
-#     cap = cv2.VideoCapture(video_path)
-#     if not cap.isOpened():
-#         raise ValueError("无法打开视频文件")
-
-#     total_fps = cap.get(cv2.CAP_PROP_FPS)
-#     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-#     duration = total_frames / total_fps
-
-#     start = start_time if isinstance(start_time, (int, float)) else 0
-#     end = end_time if isinstance(start_time, (int, float)) else duration
-#     frame_interval = max(1, int(total_fps / fps))
-#     keyframes: List[Dict[str, Any]] = []
-#     last_frame = None
-#     change_detected = False
-#     stable_counter = 0
-    
-#     while True:
-#         ret, frame = cap.read()
-#         if not ret:
-#             break
-            
-#         frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-#         timestamp = frame_idx / total_fps
-        
-#         if timestamp < start:
-#             continue
-#         if timestamp > end:
-#             break
-
-#         if frame_idx % frame_interval == 0:
-#             # 第一帧直接保留
-#             if last_frame is None:
-#                 _, buffer = cv2.imencode(".jpg", frame)
-#                 image_b64 = base64.b64encode(buffer).decode("utf-8")
-#                 keyframes.append({
-#                     "timestamp": timestamp,
-#                     "image_b64": image_b64,
-#                     "ssim": None
-#                 })
-#                 last_frame = frame
-#             else:
-#                 sim = _compute_ssim(last_frame, frame)
-                
-#                 if sim < ssim_th:
-#                     # 检测到变化，设置标志但不立即保存
-#                     change_detected = True
-#                     stable_counter = 0
-#                     last_frame = frame  # 更新参考帧
-#                 else:
-#                     # 没有变化或变化很小
-#                     if change_detected:
-#                         # 在变化后等待一段时间再保存
-#                         stable_counter += 1
-#                         if stable_counter >= stable_delay:
-#                             # 保存稳定的中间帧
-#                             _, buffer = cv2.imencode(".jpg", frame)
-#                             image_b64 = base64.b64encode(buffer).decode("utf-8")
-#                             keyframes.append({
-#                                 "timestamp": timestamp,
-#                                 "image_b64": image_b64,
-#                                 "ssim": sim
-#                             })
-#                             last_frame = frame
-#                             change_detected = False
-#                             stable_counter = 0
-#                     else:
-#                         # 正常情况，没有检测到变化，直接保存
-#                         _, buffer = cv2.imencode(".jpg", frame)
-#                         image_b64 = base64.b64encode(buffer).decode("utf-8")
-#                         keyframes.append({
-#                             "timestamp": timestamp,
-#                             "image_b64": image_b64,
-#                             "ssim": sim
-#                         })
-#                         last_frame = frame
-#     print(len(keyframes))
-
-#     cap.release()
-#     return keyframes
 
 
 
@@ -564,6 +485,64 @@ async def get_basic_video_info(video_path: str) -> dict:
         "file_modified": datetime.fromtimestamp(file_stats.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
     }
 
+def parse_timestamp_from_filename(filename: str) -> float:
+    """从文件名解析时间戳"""
+    # 匹配格式：00m28s000ms, 01m30s500ms 等
+    match = re.search(r'(\d+)m(\d+)s(\d+)ms', filename)
+    if match:
+        minutes = int(match.group(1))
+        seconds = int(match.group(2))
+        milliseconds = int(match.group(3))
+        return minutes * 60 + seconds + milliseconds / 1000.0
+    
+    # 尝试其他可能的格式
+    # 格式：128.5 (纯数字)
+    match_float = re.search(r'(\d+\.\d+)', filename)
+    if match_float:
+        return float(match_float.group(1))
+    
+    # 格式：128 (整数)
+    match_int = re.search(r'(\d+)', filename)
+    if match_int:
+        return float(match_int.group(1))
+        
+    raise ValueError(f"无法从文件名解析时间戳: {filename}")
+def load_cached_keyframes(output_dir: str) -> List[Dict[str, Any]]:
+    """从已保存的图片加载关键帧数据"""
+    if not os.path.exists(output_dir):
+        return None
+        
+    keyframe_files = sorted([f for f in os.listdir(output_dir) if f.endswith('.jpg')])
+    if not keyframe_files:
+        return None
+        
+    keyframes = []
+    for filename in keyframe_files:
+        try:
+            # 从文件名提取时间戳
+            timestamp = parse_timestamp_from_filename(filename)
+            
+            # 读取图片文件
+            img_path = os.path.join(output_dir, filename)
+            frame = cv2.imread(img_path)
+            
+            if frame is not None:
+                # 重新编码为base64
+                _, buffer = cv2.imencode(".jpg", frame)
+                image_b64 = base64.b64encode(buffer).decode("utf-8")
+                
+                keyframes.append({
+                    "timestamp": timestamp,
+                    "image_b64": image_b64,
+                    "frame": frame
+                })
+            else:
+                print(f"无法读取图片: {img_path}")
+        except (ValueError, Exception) as e:
+            print(f"加载缓存图片 {filename} 时出错: {e}")
+            continue
+            
+    return keyframes if keyframes else None
 # ==========================
 # 工具 2：video_understanding
 # ==========================
@@ -596,11 +575,20 @@ async def video_understanding(
 
     print(VIDEO_QA_PROMPT.format(transcription=transcription, question=vlm_prompt,file_name = file_name, file_description = file_description))
 
-    frames = extract_keyframes_with_ssim(path, start_time, end_time, fps=0.5)  # 低频抽一帧即可
+
+
+    start_flie = start_time if isinstance(start_time, (int, float)) else None
+    end_file   = end_time   if isinstance(end_time, (int, float)) else None
+    output_dir = fr".\keyframes\{file_name}_{start_flie}_{end_file}"      # 用统一路径
+    print(output_dir)
+    if os.path.isdir(output_dir) and any(f.endswith(('.jpg', '.png')) for f in os.listdir(output_dir)):
+        frames = load_cached_keyframes(output_dir)
+    else:
+        frames = extract_keyframes_with_ssim(path, start_time, end_time, fps=0.5)
     log.info(f"frames num：{len(frames)}")
 
-    save_keyframe_images_simple(frames,output_dir=f".\keyframes\{file_name}",)
-    # save_keyframe_images_simple(frames,output_dir=f".\keyframes\\",)
+    save_keyframe_images_simple(frames, output_dir=output_dir)
+
 
 
     if not frames:
@@ -638,13 +626,15 @@ async def video_understanding(
 if __name__ == "__main__":
     mcp.run()
     # async def _test():
+    #     for i in ['采销介绍','逛京东_副本','买iphone_副本','grgww5','iphone','kadj4','kxjs3','qkvn6']:
+    #     # for i in ['买iphone_副本']:
+    #         video_path = rf"F:\project\agent\jd\hzz\jd_multi\test\{i}.mp4"
 
-    #     video_path = "./cache_dir/uploads/20251106114244_买iphone_副本.mp4"
 
-
-    #     # 示例 2：简单问题回答
-    #     prompt2 = "用户加入购物车的第一个商品内存版本比相同配色的最小内存版本大了多少？单位GB，直接输出数字"
-    #     answer = await  video_understanding(video_path, prompt2)
-    #     # answer = video_understanding(video_path, prompt2, start_time=30, end_time=32)
-    #     print(answer)
+    #         # 示例 2：简单问题回答
+    #         prompt2 = "用户加入购物车的第一个商品内存版本比相同配色的最小内存版本大了多少？单位GB，直接输出数字"
+    #         answer = await  video_understanding(video_path, prompt2)
+    #         # answer = await video_understanding(video_path, prompt2, start_time=30, end_time=32)
+    #         # answer = await video_understanding(video_path, prompt2, start_time=4)
+    #         print(answer)
     # asyncio.run(_test())
